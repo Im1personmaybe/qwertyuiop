@@ -73,11 +73,10 @@ const server = http.createServer((req, res) => {
       const contentType = proxyRes.headers['content-type'] || '';
       const proxyBase = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`;
 
-      // Rewrite HTML to proxy all links
       if (contentType.includes('text/html')) {
         const base = new URL(target);
 
-        // Relative URLs -> absolute -> proxy
+        // 1. Relative URLs -> proxy
         data = data.replace(
           /(href|src|action)=["'](?!https?:\/\/|\/\/|#|javascript:|mailto:|data:|about:)([^"']*)["']/gi,
           (match, attr, path) => {
@@ -88,16 +87,16 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // Same-domain absolute URLs -> proxy
+        // 2. Same-domain absolute URLs -> proxy
         const domain = base.hostname.replace(/\./g, '\\.');
         const sameDomain = new RegExp(`(href|src|action)=["'](https?://(?:[^/]*\\.)?${domain}[^"']*)["']`, 'gi');
         data = data.replace(sameDomain, (match, attr, u) => {
           return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
         });
 
-        // DuckDuckGo HTML result links (duckduckgo.com/l/?uddg=...)
+        // 3. DuckDuckGo redirect links (uddg parameter)
         data = data.replace(
-          /(href|src)=["'](https?:\/\/duckduckgo\.com\/l\/\?uddg=([^"&]+)[^"']*)["']/gi,
+          /(href|src)=["'](https?:\/\/duckduckgo\.com\/l\/\?[^"']*uddg=([^"&]+)[^"']*)["']/gi,
           (match, attr, full, encoded) => {
             try {
               const decoded = decodeURIComponent(encoded);
@@ -106,13 +105,32 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // Meta refresh
+        // 4. DuckDuckGo HTML form action
+        data = data.replace(
+          /(action)=["'](https?:\/\/html\.duckduckgo\.com\/html\/[^"']*)["']/gi,
+          (match, attr, u) => {
+            return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
+          }
+        );
+
+        // 5. Meta refresh
         data = data.replace(
           /content=["']0;\s*url=([^"']+)["']/gi,
           (match, u) => {
             try {
               const abs = new URL(u, base).href;
               return `content="0;url=${proxyBase}/proxy?url=${encodeURIComponent(abs)}"`;
+            } catch (e) { return match; }
+          }
+        );
+
+        // 6. Fix base tag if present
+        data = data.replace(
+          /<base\s+href=["']([^"']+)["']/i,
+          (match, baseHref) => {
+            try {
+              const abs = new URL(baseHref, base).href;
+              return `<base href="${proxyBase}/proxy?url=${encodeURIComponent(abs)}"`;
             } catch (e) { return match; }
           }
         );
