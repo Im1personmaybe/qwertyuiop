@@ -4,12 +4,7 @@ const url = require('url');
 
 const PORT = process.env.PORT || 3000;
 
-// Your Render domain (needed for URL rewriting)
-const PROXY_HOST = process.env.PROXY_HOST || '';
-
-setInterval(() => {
-  console.log('Keep-alive:', new Date().toISOString());
-}, 5 * 60 * 1000);
+setInterval(() => console.log('alive:', new Date().toISOString()), 5 * 60 * 1000);
 
 function fetchUrl(targetUrl, callback) {
   try {
@@ -21,14 +16,13 @@ function fetchUrl(targetUrl, callback) {
       port: parsed.port || (parsed.protocol === 'https:' ? 443 : 80),
       path: parsed.pathname + parsed.search,
       method: 'GET',
-      timeout: 30000,
+      timeout: 25000,
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'Connection': 'keep-alive'
       }
     };
 
@@ -39,39 +33,28 @@ function fetchUrl(targetUrl, callback) {
       res.on('end', () => callback(null, res, data));
     });
 
-    req.on('error', (err) => callback(err));
-    req.on('timeout', () => {
-      req.destroy();
-      callback(new Error('Timeout'));
-    });
+    req.on('error', err => callback(err));
+    req.on('timeout', () => { req.destroy(); callback(new Error('timeout')); });
     req.end();
 
-  } catch (err) {
-    callback(err);
-  }
+  } catch (err) { callback(err); }
 }
 
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, HEAD, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-  if (req.method === 'OPTIONS') {
-    res.writeHead(200);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(200); res.end(); return; }
 
   const parsed = url.parse(req.url, true);
 
-  // Health check
   if (parsed.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'alive', time: new Date().toISOString() }));
+    res.end(JSON.stringify({ status: 'alive' }));
     return;
   }
 
-  // Proxy endpoint
   if (parsed.pathname === '/proxy') {
     const target = parsed.query.url;
     if (!target) {
@@ -83,37 +66,56 @@ const server = http.createServer((req, res) => {
     fetchUrl(target, (err, proxyRes, data) => {
       if (err) {
         res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Failed to fetch', message: err.message }));
+        res.end(JSON.stringify({ error: err.message }));
         return;
       }
 
       const contentType = proxyRes.headers['content-type'] || '';
+      const proxyBase = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`;
 
-      // If it's HTML, rewrite URLs to go through proxy
+      // Rewrite HTML to proxy all links
       if (contentType.includes('text/html')) {
-        const proxyBase = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`;
-        
-        // Rewrite href/src URLs to route through proxy
+        const base = new URL(target);
+
+        // Relative URLs -> absolute -> proxy
         data = data.replace(
-          /(href|src|action)=["'](?!https?:\/\/|\/\/|#|javascript:|mailto:|data:)([^"']+)["']/gi,
+          /(href|src|action)=["'](?!https?:\/\/|\/\/|#|javascript:|mailto:|data:|about:)([^"']*)["']/gi,
           (match, attr, path) => {
             try {
-              const baseUrl = new URL(target);
-              const absolute = new URL(path, baseUrl).href;
-              return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(absolute)}"`;
-            } catch (e) {
-              return match;
-            }
+              const abs = new URL(path, base).href;
+              return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(abs)}"`;
+            } catch (e) { return match; }
           }
         );
 
-        // Rewrite absolute URLs in same domain to also go through proxy
-        const targetHost = new URL(target).hostname;
-        const sameDomainPattern = new RegExp(`(href|src|action)=["']https?://([^/]*${targetHost.replace(/\./g, '\\.')}[^"']*)["']`, 'gi');
-        
-        data = data.replace(sameDomainPattern, (match, attr, url) => {
-          return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(url)}"`;
+        // Same-domain absolute URLs -> proxy
+        const domain = base.hostname.replace(/\./g, '\\.');
+        const sameDomain = new RegExp(`(href|src|action)=["'](https?://(?:[^/]*\\.)?${domain}[^"']*)["']`, 'gi');
+        data = data.replace(sameDomain, (match, attr, u) => {
+          return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
         });
+
+        // DuckDuckGo HTML result links (duckduckgo.com/l/?uddg=...)
+        data = data.replace(
+          /(href|src)=["'](https?:\/\/duckduckgo\.com\/l\/\?uddg=([^"&]+)[^"']*)["']/gi,
+          (match, attr, full, encoded) => {
+            try {
+              const decoded = decodeURIComponent(encoded);
+              return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(decoded)}"`;
+            } catch (e) { return match; }
+          }
+        );
+
+        // Meta refresh
+        data = data.replace(
+          /content=["']0;\s*url=([^"']+)["']/gi,
+          (match, u) => {
+            try {
+              const abs = new URL(u, base).href;
+              return `content="0;url=${proxyBase}/proxy?url=${encodeURIComponent(abs)}"`;
+            } catch (e) { return match; }
+          }
+        );
       }
 
       res.writeHead(proxyRes.statusCode, {
@@ -129,6 +131,4 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(PORT, () => {
-  console.log(`Prøxy running on port ${PORT}`);
-});
+server.listen(PORT, () => console.log(`Prøxy on ${PORT}`));
