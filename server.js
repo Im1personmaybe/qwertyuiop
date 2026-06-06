@@ -22,7 +22,8 @@ function fetchUrl(targetUrl, callback) {
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
         'Accept-Language': 'en-US,en;q=0.9',
         'Accept-Encoding': 'identity',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'Referer': 'https://www.google.com/'
       }
     };
 
@@ -76,7 +77,7 @@ const server = http.createServer((req, res) => {
       if (contentType.includes('text/html')) {
         const base = new URL(target);
 
-        // 1. Relative URLs -> proxy
+        // Relative URLs -> proxy
         data = data.replace(
           /(href|src|action)=["'](?!https?:\/\/|\/\/|#|javascript:|mailto:|data:|about:)([^"']*)["']/gi,
           (match, attr, path) => {
@@ -87,14 +88,14 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // 2. Same-domain absolute URLs -> proxy
+        // Same-domain absolute URLs -> proxy
         const domain = base.hostname.replace(/\./g, '\\.');
         const sameDomain = new RegExp(`(href|src|action)=["'](https?://(?:[^/]*\\.)?${domain}[^"']*)["']`, 'gi');
         data = data.replace(sameDomain, (match, attr, u) => {
           return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
         });
 
-        // 3. DuckDuckGo redirect links (uddg parameter)
+        // DuckDuckGo redirect links (uddg parameter)
         data = data.replace(
           /(href|src)=["'](https?:\/\/duckduckgo\.com\/l\/\?[^"']*uddg=([^"&]+)[^"']*)["']/gi,
           (match, attr, full, encoded) => {
@@ -105,7 +106,7 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // 4. DuckDuckGo HTML form action
+        // DuckDuckGo HTML form action
         data = data.replace(
           /(action)=["'](https?:\/\/html\.duckduckgo\.com\/html\/[^"']*)["']/gi,
           (match, attr, u) => {
@@ -113,7 +114,7 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // 5. Meta refresh
+        // Meta refresh
         data = data.replace(
           /content=["']0;\s*url=([^"']+)["']/gi,
           (match, u) => {
@@ -124,7 +125,7 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // 6. Fix base tag if present
+        // Base tag
         data = data.replace(
           /<base\s+href=["']([^"']+)["']/i,
           (match, baseHref) => {
@@ -138,6 +139,55 @@ const server = http.createServer((req, res) => {
 
       res.writeHead(proxyRes.statusCode, {
         'Content-Type': contentType,
+        'Access-Control-Allow-Origin': '*'
+      });
+      res.end(data);
+    });
+    return;
+  }
+
+  // Search endpoint - returns HTML search results directly
+  if (parsed.pathname === '/search') {
+    const query = parsed.query.q;
+    if (!query) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Missing ?q=' }));
+      return;
+    }
+
+    // Use Bing HTML search (works better with proxies)
+    const searchUrl = `https://www.bing.com/search?q=${encodeURIComponent(query)}`;
+
+    fetchUrl(searchUrl, (err, proxyRes, data) => {
+      if (err) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: err.message }));
+        return;
+      }
+
+      const proxyBase = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`;
+
+      // Rewrite Bing links to go through proxy
+      data = data.replace(
+        /(href)=["'](https?:\/\/www\.bing\.com\/aclick\?[^"']*)["']/gi,
+        (match, attr, u) => {
+          return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
+        }
+      );
+
+      // Rewrite regular result links
+      data = data.replace(
+        /(href)=["'](https?:\/\/[^"']+)["']/gi,
+        (match, attr, u) => {
+          if (u.includes('bing.com') || u.includes('microsoft.com')) {
+            return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
+          }
+          return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
+        }
+      );
+
+      res.writeHead(200, {
+        'Content-Type': 'text/html',
         'Access-Control-Allow-Origin': '*'
       });
       res.end(data);
