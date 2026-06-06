@@ -1,8 +1,70 @@
+// server.js - Proxy with built-in ad blocker
 const http = require('http');
 const https = require('https');
 const url = require('url');
 
 const PORT = process.env.PORT || 3000;
+
+// Ad/tracker domain blocklist
+const BLOCKED_DOMAINS = [
+  // Google ads & analytics
+  'googleadservices.com', 'googlesyndication.com', 'googletagmanager.com',
+  'google-analytics.com', 'doubleclick.net', 'googleads.g.doubleclick.net',
+  'pagead2.googlesyndication.com', 'tpc.googlesyndication.com',
+  'pubads.g.doubleclick.net', 'securepubads.g.doubleclick.net',
+  
+  // Meta/Facebook
+  'facebook.com/tr', 'connect.facebook.net', 'facebook.net',
+  'pixel.facebook.com', 'an.facebook.com',
+  
+  // Amazon
+  'amazon-adsystem.com', 'aax.amazon-adsystem.com',
+  
+  // Microsoft
+  'bat.bing.com', 'c.bing.com',
+  
+  // Other major ad networks
+  'adsystem.amazon.com', 'ads.yahoo.com', 'ad.doubleclick.net',
+  'adsystem.com', 'adsrvr.org', 'advertising.com',
+  'adsafeprotected.com', 'moatads.com', 'outbrain.com',
+  'taboola.com', 'taboola.syndication', 'revcontent.com',
+  'mgid.com', 'adroll.com', 'criteo.com', 'criteo.net',
+  'quantserve.com', 'scorecardresearch.com', 'zedo.com',
+  'openx.net', 'rubiconproject.com', 'pubmatic.com',
+  'appnexus.com', 'adnxs.com', 'adsystem.com',
+  
+  // Analytics
+  'hotjar.com', 'hotjar.io', 'cdn.hotjar.com',
+  'segment.io', 'segment.com', 'cdn.segment.com',
+  'mixpanel.com', 'amplitude.com', 'heapanalytics.com',
+  'fullstory.com', 'logrocket.com', 'sentry.io',
+  'bugsnag.com', 'datadoghq.com',
+  
+  // Social widgets
+  'platform.twitter.com', 'platform.linkedin.com',
+  'widgets.pinterest.com', 'assets.pinterest.com',
+  
+  // Popups/malware
+  'popads.net', 'popcash.net', 'propellerads.com',
+  'onclickads.net', 'adsterra.com', 'ad-maven.com',
+  'clickadu.com', 'hilltopads.net', 'exoclick.com',
+  
+  // More trackers
+  'addthis.com', 'sharethis.com', 'addtoany.com',
+  'disqus.com', 'disquscdn.com',
+  'gravatar.com', 'wp.com', 'wordpress.com'
+];
+
+// Check if URL is blocked
+function isBlocked(targetUrl) {
+  try {
+    const parsed = new URL(targetUrl);
+    const hostname = parsed.hostname.toLowerCase();
+    return BLOCKED_DOMAINS.some(blocked => hostname.includes(blocked));
+  } catch {
+    return false;
+  }
+}
 
 setInterval(() => console.log('alive:', new Date().toISOString()), 5 * 60 * 1000);
 
@@ -51,11 +113,11 @@ const server = http.createServer((req, res) => {
 
   if (parsed.pathname === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ status: 'alive' }));
+    res.end(JSON.stringify({ status: 'alive', adblocker: 'enabled', blocked: BLOCKED_DOMAINS.length }));
     return;
   }
 
-  // CUSTOM SEARCH ENDPOINT - fetches Bing and returns proxied results
+  // Custom search endpoint
   if (parsed.pathname === '/search') {
     const query = parsed.query.q;
     if (!query) {
@@ -75,22 +137,20 @@ const server = http.createServer((req, res) => {
 
       const proxyBase = `${req.headers['x-forwarded-proto'] || 'https'}://${req.headers.host}`;
 
-      // Extract search results and build our own clean HTML
-      // This avoids Bing's complex JS and tracking
       let results = [];
-      
-      // Extract titles and URLs from Bing results
       const titleRegex = /<a[^>]*href="([^"]+)"[^>]*h="[^"]*"[^>]*>(.*?)<\/a>/gi;
       let match;
       while ((match = titleRegex.exec(data)) !== null) {
         const href = match[1];
         const title = match[2].replace(/<[^>]+>/g, '').trim();
         if (href && title && href.startsWith('http') && !href.includes('bing.com') && title.length > 3) {
-          results.push({ url: href, title });
+          // Skip blocked domains
+          if (!isBlocked(href)) {
+            results.push({ url: href, title });
+          }
         }
       }
 
-      // Build clean search results page
       let html = `<!DOCTYPE html>
 <html>
 <head>
@@ -106,6 +166,7 @@ const server = http.createServer((req, res) => {
     .result a:hover { text-decoration: underline; }
     .result .url { color: #22c55e; font-size: 12px; margin-top: 4px; word-break: break-all; }
     .no-results { color: #888; text-align: center; margin-top: 40px; }
+    .blocked { color: #ef4444; font-size: 11px; margin-top: 20px; text-align: center; }
   </style>
 </head>
 <body>
@@ -115,7 +176,6 @@ const server = http.createServer((req, res) => {
       if (results.length === 0) {
         html += `<p class="no-results">No results found. Try a different search.</p>`;
       } else {
-        // Deduplicate
         const seen = new Set();
         results.forEach(r => {
           if (!seen.has(r.url)) {
@@ -129,6 +189,7 @@ const server = http.createServer((req, res) => {
         });
       }
 
+      html += `<p class="blocked">🛡️ Ad blocker active — ${BLOCKED_DOMAINS.length} trackers blocked</p>`;
       html += `</body></html>`;
 
       res.writeHead(200, {
@@ -140,12 +201,19 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // PROXY ENDPOINT
+  // Proxy endpoint with ad blocking
   if (parsed.pathname === '/proxy') {
     const target = parsed.query.url;
     if (!target) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Missing ?url=' }));
+      return;
+    }
+
+    // Block ads/trackers at the request level
+    if (isBlocked(target)) {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' });
+      res.end('/* Blocked by ad blocker */');
       return;
     }
 
@@ -162,7 +230,27 @@ const server = http.createServer((req, res) => {
       if (contentType.includes('text/html')) {
         const base = new URL(target);
 
-        // Relative URLs -> proxy
+        // Remove ad/tracker scripts and iframes entirely
+        data = data.replace(/<script[^>]*src=["']https?:\/\/[^"']*(google|analytics|ads|tracking|facebook|twitter|gtag|ga\.js|doubleclick)[^"']*["'][^>]*><\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?googleads[\s\S]*?)<\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?gtag[\s\S]*?)<\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?googletag[\s\S]*?)<\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?fbq[\s\S]*?)<\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?facebook[\s\S]*?)<\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?analytics[\s\S]*?)<\/script>/gi, '');
+        
+        // Remove iframes from ad domains
+        data = data.replace(/<iframe[^>]*src=["']https?:\/\/[^"']*(google|doubleclick|adsystem|facebook)[^"']*["'][^>]*><\/iframe>/gi, '');
+        
+        // Remove ad containers by common class/id names
+        data = data.replace(/<(div|section|aside)[^>]*class=["'][^"']*(ad|ads|advertisement|banner|sponsored|promo)[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi, '');
+        data = data.replace(/<(div|section|aside)[^>]*id=["'][^"']*(ad|ads|advertisement|banner|sponsored|promo)[^"']*["'][^>]*>[\s\S]*?<\/\1>/gi, '');
+
+        // Remove inline scripts that contain tracking
+        data = data.replace(/<script[^>]*>([\s\S]*?window\.dataLayer[\s\S]*?)<\/script>/gi, '');
+        data = data.replace(/<script[^>]*>([\s\S]*?_gaq[\s\S]*?)<\/script>/gi, '');
+
+        // 1. Relative URLs -> proxy
         data = data.replace(
           /(href|src|action)=["'](?!https?:\/\/|\/\/|#|javascript:|mailto:|data:|about:)([^"']*)["']/gi,
           (match, attr, path) => {
@@ -173,27 +261,45 @@ const server = http.createServer((req, res) => {
           }
         );
 
-        // ALL absolute URLs -> proxy
+        // 2. ALL absolute URLs -> proxy (skip already proxied + blocked domains)
         data = data.replace(
           /(href|src|action)=["'](https?:\/\/[^"']+)["']/gi,
           (match, attr, u) => {
+            // Skip if already proxied
             if (u.includes(req.headers.host + '/proxy?url=')) return match;
+            // Block ad/tracker URLs
+            if (isBlocked(u)) {
+              return attr === 'src' ? `${attr}="data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7"` : `${attr}="#"`;
+            }
             return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(u)}"`;
           }
         );
 
-        // Meta refresh
+        // 3. DuckDuckGo redirect links
+        data = data.replace(
+          /(href|src)=["'](https?:\/\/duckduckgo\.com\/l\/\?[^"']*uddg=([^"&]+)[^"']*)["']/gi,
+          (match, attr, full, encoded) => {
+            try {
+              const decoded = decodeURIComponent(encoded);
+              if (isBlocked(decoded)) return `${attr}="#"`;
+              return `${attr}="${proxyBase}/proxy?url=${encodeURIComponent(decoded)}"`;
+            } catch (e) { return match; }
+          }
+        );
+
+        // 4. Meta refresh
         data = data.replace(
           /content=["']0;\s*url=([^"']+)["']/gi,
           (match, u) => {
             try {
               const abs = new URL(u, base).href;
+              if (isBlocked(abs)) return `content="0;url=#"`;
               return `content="0;url=${proxyBase}/proxy?url=${encodeURIComponent(abs)}"`;
             } catch (e) { return match; }
           }
         );
 
-        // Base tag
+        // 5. Base tag
         data = data.replace(
           /<base\s+href=["']([^"']+)["']/i,
           (match, baseHref) => {
@@ -218,4 +324,4 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ error: 'Not found' }));
 });
 
-server.listen(PORT, () => console.log(`Prøxy on ${PORT}`));
+server.listen(PORT, () => console.log(`Prøxy + AdBlock on ${PORT}`));
