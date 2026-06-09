@@ -4,6 +4,7 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const zlib = require('zlib');
+const querystring = require('querystring');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -12,6 +13,7 @@ app.use(cors({ origin: '*', credentials: true }));
 app.use(express.json({ limit: '50mb' }));
 app.use(express.text({ type: 'text/*', limit: '50mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '50mb' }));
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 const BROWSER_HEADERS = {
   'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
@@ -142,7 +144,7 @@ function rewriteHTML(body, targetUrl, req) {
     return _open.call(this, url ? pu(url) : url, name, features);
   };
 
-  // Patch createElement for scripts, links, images, iframes, media
+  // Patch createElement
   const _createEl = document.createElement;
   document.createElement = function(tag) {
     const el = _createEl.call(document, tag);
@@ -162,6 +164,23 @@ function rewriteHTML(body, targetUrl, req) {
     return el;
   };
 
+  // Intercept form submissions
+  document.addEventListener('submit', function(e) {
+    const form = e.target;
+    if (form.tagName === 'FORM') {
+      if (form.action && !form.action.startsWith(PROXY_BASE)) {
+        form.action = pu(form.action);
+      }
+      // Also rewrite any hidden inputs that contain URLs
+      const inputs = form.querySelectorAll('input[type="hidden"]');
+      inputs.forEach(function(inp) {
+        if (inp.value && inp.value.match(/^https?:\\/\\//)) {
+          inp.value = pu(inp.value);
+        }
+      });
+    }
+  }, true);
+
   // Intercept clicks on <a> tags
   document.addEventListener('click', function(e) {
     let a = e.target;
@@ -174,11 +193,11 @@ function rewriteHTML(body, targetUrl, req) {
 </script>`;
 
   // Inject <base> and patch script after <head>
-  body = body.replace(/<<head([^>]*)>/i, `<head$1><base href="${origin}">${patchScript}`);
+  body = body.replace(/<head([^>]*)>/i, `<head$1><base href="${origin}">${patchScript}`);
 
   // If no <head>, prepend to <html> or start of body
   if (!body.includes('<base href=')) {
-    body = body.replace(/<<html[^>]*>/i, `$&<<base href="${origin}">${patchScript}`);
+    body = body.replace(/<html[^>]*>/i, `$&<base href="${origin}">${patchScript}`);
   }
 
   // Rewrite all URL attributes (double and single quotes)
@@ -187,7 +206,7 @@ function rewriteHTML(body, targetUrl, req) {
   });
 
   // Rewrite meta refresh
-  body = body.replace(/<<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/gi, (match) => {
+  body = body.replace(/<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/gi, (match) => {
     return match.replace(/content=["'](\d+);\s*url=([^"']+)["']/i, (m, delay, url) => {
       return `content="${delay};url=${p(url)}"`;
     });
@@ -199,12 +218,12 @@ function rewriteHTML(body, targetUrl, req) {
   });
 
   // Rewrite <style> tags
-  body = body.replace(/<<style[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
+  body = body.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (match, css) => {
     return `<style>${rewriteCSS(css, targetUrl, req)}</style>`;
   });
 
   // Rewrite inline scripts
-  body = body.replace(/<<script([^>]*)>([\s\S]*?)<<\/script>/gi, (match, attrs, js) => {
+  body = body.replace(/<script([^>]*)>([\s\S]*?)<\/script>/gi, (match, attrs, js) => {
     if (attrs.includes('src=') || attrs.includes("src=")) return match;
     return `<script${attrs}>${rewriteJS(js, targetUrl, req)}</script>`;
   });
@@ -409,8 +428,13 @@ async function proxyPass(targetUrl, req, res) {
       if (Buffer.isBuffer(req.body)) proxyReq.end(req.body);
       else if (typeof req.body === 'string') proxyReq.end(req.body);
       else if (req.body && Object.keys(req.body).length) {
-        proxyReq.setHeader('Content-Type', 'application/json');
-        proxyReq.end(JSON.stringify(req.body));
+        const ct = req.headers['content-type'] || '';
+        if (ct.includes('application/x-www-form-urlencoded')) {
+          proxyReq.end(querystring.stringify(req.body));
+        } else {
+          proxyReq.setHeader('Content-Type', 'application/json');
+          proxyReq.end(JSON.stringify(req.body));
+        }
       } else {
         req.pipe(proxyReq);
       }
@@ -437,6 +461,7 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
+// Handle POST to /proxy (form submissions from rewritten forms)
 app.all('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).json({ error: 'Missing ?url=' });
@@ -477,8 +502,8 @@ app.get('/search', async (req, res) => {
     });
 
     const items = [];
-    const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<<\/a>/g;
-    const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<<\/a>/g;
+    const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g;
+    const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<\/a>/g;
 
     let m;
     while ((m = linkRe.exec(html)) !== null) {
@@ -488,13 +513,13 @@ app.get('/search', async (req, res) => {
         if (uddg) href = decodeURIComponent(uddg[1]);
       }
       if (href.startsWith('//')) href = 'https:' + href;
-      const title = m[2].replace(/<<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      const title = m[2].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
       items.push({ title, href, snippet: '' });
     }
 
     let i = 0;
     while ((m = snipRe.exec(html)) !== null && i < items.length) {
-      items[i].snippet = m[1].replace(/<<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      items[i].snippet = m[1].replace(/<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
       i++;
     }
 
