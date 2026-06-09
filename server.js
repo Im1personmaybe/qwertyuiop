@@ -89,7 +89,6 @@ function rewriteHTML(body, targetUrl, req) {
 
   const p = (url) => proxyUrl(url, targetUrl, req);
 
-  // Inject <base> and client-side patch immediately after <head>
   const patchScript = `<script>
 (function(){
   const PROXY_BASE = '${base}';
@@ -171,7 +170,6 @@ function rewriteHTML(body, targetUrl, req) {
       if (form.action && !form.action.startsWith(PROXY_BASE)) {
         form.action = pu(form.action);
       }
-      // Also rewrite any hidden inputs that contain URLs
       const inputs = form.querySelectorAll('input[type="hidden"]');
       inputs.forEach(function(inp) {
         if (inp.value && inp.value.match(/^https?:\\/\\//)) {
@@ -195,12 +193,12 @@ function rewriteHTML(body, targetUrl, req) {
   // Inject <base> and patch script after <head>
   body = body.replace(/<head([^>]*)>/i, `<head$1><base href="${origin}">${patchScript}`);
 
-  // If no <head>, prepend to <html> or start of body
+  // If no <head>, prepend to <html>
   if (!body.includes('<base href=')) {
     body = body.replace(/<html[^>]*>/i, `$&<base href="${origin}">${patchScript}`);
   }
 
-  // Rewrite all URL attributes (double and single quotes)
+  // Rewrite all URL attributes
   body = body.replace(/(href|src|action|data-src|poster|data-url|data-href|srcset|formaction|background|manifest|modulepreload|preload|cite|longdesc|profile|codebase|data)=["']([^"']*)["']/gi, (match, attr, url) => {
     return `${attr}="${p(url)}"`;
   });
@@ -234,7 +232,6 @@ function rewriteHTML(body, targetUrl, req) {
 function rewriteCSS(css, targetUrl, req) {
   const base = getProxyBase(req);
 
-  // url(...)
   css = css.replace(/url\(["']?([^"')]+)["']?\)/g, (match, url) => {
     if (url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('#')) return match;
     try {
@@ -246,7 +243,6 @@ function rewriteCSS(css, targetUrl, req) {
     } catch { return match; }
   });
 
-  // @import
   css = css.replace(/@import\s+(?:url\()?["']([^"']+)["']\)?/g, (match, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -260,7 +256,6 @@ function rewriteCSS(css, targetUrl, req) {
 function rewriteJS(js, targetUrl, req) {
   const base = getProxyBase(req);
 
-  // fetch("url")
   js = js.replace(/fetch\s*\(\s*["']([^"']+)["']\s*[,)]/g, (match, url) => {
     if (url.startsWith('data:') || url.startsWith('blob:')) return match;
     try {
@@ -269,7 +264,6 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // XMLHttpRequest.open("GET", "url")
   js = js.replace(/\.open\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']/g, (match, method, url) => {
     if (url.startsWith('data:') || url.startsWith('blob:')) return match;
     try {
@@ -278,7 +272,6 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // new WebSocket("url")
   js = js.replace(/new\s+WebSocket\s*\(\s*["']([^"']+)["']\s*\)/g, (match, url) => {
     let u = url;
     if (u.startsWith('wss://')) u = u.replace('wss://', 'https://');
@@ -289,7 +282,6 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // axios.get/post("url")
   js = js.replace(/axios\.(get|post|put|delete|patch|head|options)\s*\(\s*["']([^"']+)["']/g, (match, method, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -297,7 +289,6 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // importScripts("url")
   js = js.replace(/importScripts\s*\(\s*["']([^"']+)["']\s*\)/g, (match, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -305,7 +296,6 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // new Worker("url")
   js = js.replace(/new\s+Worker\s*\(\s*["']([^"']+)["']\s*\)/g, (match, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -313,7 +303,6 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // history.pushState/replaceState
   js = js.replace(/(history\.(?:pushState|replaceState)\s*\([^,]+,[^,]+,\s*["'])([^"']+)(["']\s*\))/g, (match, prefix, url, suffix) => {
     try {
       const u = new URL(url, targetUrl);
@@ -461,7 +450,6 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
 
-// Handle POST to /proxy (form submissions from rewritten forms)
 app.all('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).json({ error: 'Missing ?url=' });
@@ -474,9 +462,28 @@ app.all('/youtube/*', async (req, res) => {
   try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
 });
 
+// DuckDuckGo HTML proxy - uses the JS-free html.duckduckgo.com
 app.get('/ddg', async (req, res) => {
   const q = req.query.q;
-  if (!q) return res.status(400).json({ error: 'Missing ?q=' });
+  if (!q) {
+    // If no query, show the HTML version homepage
+    const target = 'https://html.duckduckgo.com/html/';
+    try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
+    return;
+  }
+  const target = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
+});
+
+// Also handle POST to /ddg for form submissions
+app.post('/ddg', async (req, res) => {
+  // DuckDuckGo HTML form submits to /html/ with form data
+  const q = req.body.q || req.query.q;
+  if (!q) {
+    const target = 'https://html.duckduckgo.com/html/';
+    try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
+    return;
+  }
   const target = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
   try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
 });
