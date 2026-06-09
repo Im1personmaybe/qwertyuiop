@@ -8,10 +8,7 @@ const zlib = require('zlib');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// CORS for all origins
 app.use(cors({ origin: '*', credentials: true }));
-
-// Body parsers (skip for raw proxy streaming)
 app.use(express.json({ limit: '50mb' }));
 app.use(express.text({ type: 'text/*', limit: '50mb' }));
 app.use(express.raw({ type: 'application/octet-stream', limit: '50mb' }));
@@ -31,6 +28,34 @@ const BROWSER_HEADERS = {
   'Sec-Fetch-User': '?1',
   'Upgrade-Insecure-Requests': '1'
 };
+
+// Cookie jar per session
+const cookieJars = new Map();
+function getJar(sid) {
+  if (!sid) return null;
+  if (!cookieJars.has(sid)) cookieJars.set(sid, new Map());
+  return cookieJars.get(sid);
+}
+function cookieHeaderFor(jar, hostname) {
+  if (!jar) return null;
+  const out = [];
+  for (const [name, meta] of jar.entries()) {
+    if (!meta.domain || hostname.includes(meta.domain)) out.push(`${name}=${meta.value}`);
+  }
+  return out.length ? out.join('; ') : null;
+}
+function storeCookies(jar, setCookieHeader) {
+  if (!jar || !setCookieHeader) return;
+  const arr = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
+  for (const c of arr) {
+    const [main] = c.split(';');
+    const [name, ...valParts] = main.trim().split('=');
+    if (!name || valParts.length === 0) continue;
+    const value = valParts.join('=');
+    const dm = c.match(/Domain=([^;]+)/i);
+    jar.set(name.trim(), { value: value.trim(), domain: dm ? dm[1].trim() : null });
+  }
+}
 
 function getProxyBase(req) {
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
@@ -60,14 +85,19 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
     const client = url.protocol === 'https:' ? https : http;
     const headers = { ...BROWSER_HEADERS };
 
-    ['range', 'referer', 'origin', 'content-type', 'if-modified-since', 'if-none-match'].forEach(h => {
+    ['range', 'referer', 'origin', 'content-type', 'if-modified-since', 'if-none-match', 'authorization'].forEach(h => {
       if (req.headers[h]) headers[h] = req.headers[h];
     });
 
-    if (req.headers.cookie) headers['Cookie'] = req.headers.cookie;
+    const sid = req.headers['x-session-id'] || req.query.session;
+    const jar = getJar(sid);
+    const cHeader = cookieHeaderFor(jar, url.hostname);
+    if (cHeader) headers['Cookie'] = cHeader;
+    else if (req.headers.cookie) headers['Cookie'] = req.headers.cookie;
+
     headers['Host'] = url.hostname;
 
-    // Strip hop-by-hop headers
+    // Strip hop-by-hop
     ['connection', 'keep-alive', 'proxy-connection', 'te', 'trailers', 'upgrade'].forEach(h => delete headers[h]);
 
     const options = {
@@ -81,12 +111,28 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
     };
 
     const proxyReq = client.request(options, (proxyRes) => {
+      // Store cookies
+      if (jar && proxyRes.headers['set-cookie']) storeCookies(jar, proxyRes.headers['set-cookie']);
+
       res.status(proxyRes.statusCode);
 
-      const skip = new Set(['content-encoding', 'transfer-encoding', 'content-length', 'connection', 'keep-alive', 'proxy-connection', 'strict-transport-security']);
+      // Headers to strip so iframe embedding works
+      const strip = new Set([
+        'content-encoding', 'transfer-encoding', 'content-length',
+        'connection', 'keep-alive', 'proxy-connection',
+        'strict-transport-security',
+        'x-frame-options',
+        'content-security-policy',
+        'content-security-policy-report-only',
+        'permissions-policy',
+        'cross-origin-embedder-policy',
+        'cross-origin-opener-policy',
+        'cross-origin-resource-policy'
+      ]);
+
       Object.entries(proxyRes.headers).forEach(([key, value]) => {
         const k = key.toLowerCase();
-        if (skip.has(k)) return;
+        if (strip.has(k)) return;
         if (k === 'location') {
           res.setHeader(key, rewriteLocation(value, targetUrl, req));
           return;
@@ -95,24 +141,36 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
       });
       res.setHeader('Access-Control-Expose-Headers', '*');
 
-      // Handle compression
+      // Decompress
       const enc = proxyRes.headers['content-encoding'];
       let stream = proxyRes;
       if (enc === 'gzip') stream = proxyRes.pipe(zlib.createGunzip());
       else if (enc === 'deflate') stream = proxyRes.pipe(zlib.createInflate());
       else if (enc === 'br') stream = proxyRes.pipe(zlib.createBrotliDecompress());
 
-      // HTML rewriting for YouTube
+      // HTML rewriting for iframe proxy browsers
       if (opts.rewriteUrls && (proxyRes.headers['content-type'] || '').includes('text/html')) {
         let body = '';
         stream.on('data', c => body += c);
         stream.on('end', () => {
           const base = getProxyBase(req);
-          const mod = body
-            .replace(/(href|src|action)="https?:\/\/(www\.)?youtube\.com/g, `$1="${base}/youtube/https://youtube.com`)
-            .replace(/(href|src|action)="https?:\/\/(www\.)?googlevideo\.com/g, `$1="${base}/proxy?url=https://googlevideo.com`)
+          const ytProxy = `${base}/youtube/`;
+          const gvProxy = `${base}/proxy?url=https://`;
+
+          let mod = body
+            // Inject <base> so relative URLs work inside the iframe
+            .replace(/<<head([^>]*)>/i, `<head$1><base href="${targetUrl}">`)
+            // Absolute YouTube links
+            .replace(/(href|src|action)="https?:\/\/(www\.)?youtube\.com/g, `$1="${ytProxy}https://youtube.com`)
+            .replace(/(href|src|action)="https?:\/\/(www\.)?googlevideo\.com/g, `$1="${gvProxy}googlevideo.com`)
+            .replace(/(href|src|action)="https?:\/\/(www\.)?ytimg\.com/g, `$1="${gvProxy}ytimg.com`)
+            // Protocol-relative URLs
             .replace(/(href|src|action)="\/\//g, `$1="${base}/proxy?url=https://`)
-            .replace(/"\/(watch\?|results\?|embed\/|channel\/|c\/|user\/|playlist\?)/g, `"${base}/youtube/https://youtube.com/$1`);
+            // Root-relative URLs (best effort)
+            .replace(/(href|src|action)="\/([^/"])/g, `$1="${base}/proxy?url=${encodeURIComponent(url.origin + '/$2')}"`)
+            // YouTube path shortcuts
+            .replace(/"\/(watch\?|results\?|embed\/|channel\/|c\/|user\/|playlist\?|feed\/|shorts\/)/g, `"${ytProxy}https://youtube.com/$1`);
+
           res.setHeader('Content-Type', 'text/html; charset=utf-8');
           res.send(mod);
           resolve();
@@ -172,7 +230,7 @@ app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOStri
 app.all('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).json({ error: 'Missing ?url=' });
-  try { await proxyPass(target, req, res, { rewriteUrls: req.query.rewrite === 'true' }); }
+  try { await proxyPass(target, req, res, { rewriteUrls: req.query.rewrite !== 'false' }); }
   catch (e) { console.error(e); }
 });
 
@@ -218,6 +276,7 @@ app.get('/search', async (req, res) => {
     });
 
     const items = [];
+    // FIXED: was <<\/a>, now <\/a>
     const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<<\/a>/g;
     const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<<\/a>/g;
 
@@ -256,13 +315,11 @@ app.get('/ddg', async (req, res) => {
   try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
 });
 
-// Error handler
 app.use((err, req, res, next) => {
   console.error('[Server Error]', err);
   if (!res.headersSent) res.status(500).json({ error: 'Internal error', message: err.message });
 });
 
-// Bind to 0.0.0.0 so Render can reach it
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 Proxy running on port ${PORT}`);
 });
