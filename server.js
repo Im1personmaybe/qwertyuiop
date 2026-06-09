@@ -29,34 +29,6 @@ const BROWSER_HEADERS = {
   'Upgrade-Insecure-Requests': '1'
 };
 
-// Cookie jar per session
-const cookieJars = new Map();
-function getJar(sid) {
-  if (!sid) return null;
-  if (!cookieJars.has(sid)) cookieJars.set(sid, new Map());
-  return cookieJars.get(sid);
-}
-function cookieHeaderFor(jar, hostname) {
-  if (!jar) return null;
-  const out = [];
-  for (const [name, meta] of jar.entries()) {
-    if (!meta.domain || hostname.includes(meta.domain)) out.push(`${name}=${meta.value}`);
-  }
-  return out.length ? out.join('; ') : null;
-}
-function storeCookies(jar, setCookieHeader) {
-  if (!jar || !setCookieHeader) return;
-  const arr = Array.isArray(setCookieHeader) ? setCookieHeader : [setCookieHeader];
-  for (const c of arr) {
-    const [main] = c.split(';');
-    const [name, ...valParts] = main.trim().split('=');
-    if (!name || valParts.length === 0) continue;
-    const value = valParts.join('=');
-    const dm = c.match(/Domain=([^;]+)/i);
-    jar.set(name.trim(), { value: value.trim(), domain: dm ? dm[1].trim() : null });
-  }
-}
-
 function getProxyBase(req) {
   const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
   const host = req.headers['x-forwarded-host'] || req.get('host') || `localhost:${PORT}`;
@@ -85,19 +57,13 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
     const client = url.protocol === 'https:' ? https : http;
     const headers = { ...BROWSER_HEADERS };
 
-    ['range', 'referer', 'origin', 'content-type', 'if-modified-since', 'if-none-match', 'authorization'].forEach(h => {
+    ['range', 'referer', 'origin', 'content-type', 'if-modified-since', 'if-none-match'].forEach(h => {
       if (req.headers[h]) headers[h] = req.headers[h];
     });
 
-    const sid = req.headers['x-session-id'] || req.query.session;
-    const jar = getJar(sid);
-    const cHeader = cookieHeaderFor(jar, url.hostname);
-    if (cHeader) headers['Cookie'] = cHeader;
-    else if (req.headers.cookie) headers['Cookie'] = req.headers.cookie;
-
+    if (req.headers.cookie) headers['Cookie'] = req.headers.cookie;
     headers['Host'] = url.hostname;
 
-    // Strip hop-by-hop
     ['connection', 'keep-alive', 'proxy-connection', 'te', 'trailers', 'upgrade'].forEach(h => delete headers[h]);
 
     const options = {
@@ -111,12 +77,8 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
     };
 
     const proxyReq = client.request(options, (proxyRes) => {
-      // Store cookies
-      if (jar && proxyRes.headers['set-cookie']) storeCookies(jar, proxyRes.headers['set-cookie']);
-
       res.status(proxyRes.statusCode);
 
-      // Headers to strip so iframe embedding works
       const strip = new Set([
         'content-encoding', 'transfer-encoding', 'content-length',
         'connection', 'keep-alive', 'proxy-connection',
@@ -141,36 +103,25 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
       });
       res.setHeader('Access-Control-Expose-Headers', '*');
 
-      // Decompress
       const enc = proxyRes.headers['content-encoding'];
       let stream = proxyRes;
       if (enc === 'gzip') stream = proxyRes.pipe(zlib.createGunzip());
       else if (enc === 'deflate') stream = proxyRes.pipe(zlib.createInflate());
       else if (enc === 'br') stream = proxyRes.pipe(zlib.createBrotliDecompress());
 
-      // HTML rewriting for iframe proxy browsers
       if (opts.rewriteUrls && (proxyRes.headers['content-type'] || '').includes('text/html')) {
         let body = '';
         stream.on('data', c => body += c);
         stream.on('end', () => {
           const base = getProxyBase(req);
-          const ytProxy = `${base}/youtube/`;
-          const gvProxy = `${base}/proxy?url=https://`;
-
-          let mod = body
-            // Inject <base> so relative URLs work inside the iframe
+          const mod = body
             .replace(/<<head([^>]*)>/i, `<head$1><base href="${targetUrl}">`)
-            // Absolute YouTube links
-            .replace(/(href|src|action)="https?:\/\/(www\.)?youtube\.com/g, `$1="${ytProxy}https://youtube.com`)
-            .replace(/(href|src|action)="https?:\/\/(www\.)?googlevideo\.com/g, `$1="${gvProxy}googlevideo.com`)
-            .replace(/(href|src|action)="https?:\/\/(www\.)?ytimg\.com/g, `$1="${gvProxy}ytimg.com`)
-            // Protocol-relative URLs
+            .replace(/(href|src|action)="https?:\/\/(www\.)?youtube\.com/g, `$1="${base}/youtube/https://youtube.com`)
+            .replace(/(href|src|action)="https?:\/\/(www\.)?googlevideo\.com/g, `$1="${base}/proxy?url=https://googlevideo.com`)
+            .replace(/(href|src|action)="https?:\/\/(www\.)?ytimg\.com/g, `$1="${base}/proxy?url=https://ytimg.com`)
             .replace(/(href|src|action)="\/\//g, `$1="${base}/proxy?url=https://`)
-            // Root-relative URLs (best effort)
             .replace(/(href|src|action)="\/([^/"])/g, `$1="${base}/proxy?url=${encodeURIComponent(url.origin + '/$2')}"`)
-            // YouTube path shortcuts
-            .replace(/"\/(watch\?|results\?|embed\/|channel\/|c\/|user\/|playlist\?|feed\/|shorts\/)/g, `"${ytProxy}https://youtube.com/$1`);
-
+            .replace(/"\/(watch\?|results\?|embed\/|channel\/|c\/|user\/|playlist\?|feed\/|shorts\/)/g, `"${base}/youtube/https://youtube.com/$1`);
           res.setHeader('Content-Type', 'text/html; charset=utf-8');
           res.send(mod);
           resolve();
@@ -210,43 +161,34 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
   });
 }
 
-// ==================== ROUTES ====================
-
 app.get('/', (req, res) => {
-  res.json({
-    status: 'running',
-    endpoints: {
-      proxy: '/proxy?url=ENCODED_URL',
-      youtube: '/youtube/PATH',
-      search: '/search?q=QUERY',
-      health: '/health'
-    }
-  });
+  res.json({ status: 'running', endpoints: { proxy: '/proxy?url=', youtube: '/youtube/', ddg: '/ddg?q=', search: '/search?q=', health: '/health' } });
 });
 
-app.get('/health', (req, res) => res.json({ ok: true, time: new Date().toISOString() }));
+app.get('/health', (req, res) => res.json({ ok: true }));
 
-// General proxy
 app.all('/proxy', async (req, res) => {
   const target = req.query.url;
   if (!target) return res.status(400).json({ error: 'Missing ?url=' });
-  try { await proxyPass(target, req, res, { rewriteUrls: req.query.rewrite !== 'false' }); }
-  catch (e) { console.error(e); }
+  try { await proxyPass(target, req, res, { rewriteUrls: true }); } catch (e) { console.error(e); }
 });
 
-// YouTube-optimized proxy
 app.all('/youtube/*', async (req, res) => {
   const raw = req.originalUrl.replace(/^\/youtube\//, '');
   const target = raw.startsWith('http') ? raw : `https://www.youtube.com/${raw}`;
-  try { await proxyPass(target, req, res, { rewriteUrls: true }); }
-  catch (e) { console.error(e); }
+  try { await proxyPass(target, req, res, { rewriteUrls: true }); } catch (e) { console.error(e); }
 });
 
-// DuckDuckGo Search → JSON
+app.get('/ddg', async (req, res) => {
+  const q = req.query.q;
+  if (!q) return res.status(400).json({ error: 'Missing ?q=' });
+  const target = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
+  try { await proxyPass(target, req, res, { rewriteUrls: true }); } catch (e) { console.error(e); }
+});
+
 app.get('/search', async (req, res) => {
   const q = req.query.q;
   if (!q) return res.status(400).json({ error: 'Missing ?q=' });
-
   const searchUrl = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
   const headers = { ...BROWSER_HEADERS, 'Accept': 'text/html,*/*;q=0.8', 'Referer': 'https://html.duckduckgo.com/' };
 
@@ -254,29 +196,17 @@ app.get('/search', async (req, res) => {
     const html = await new Promise((resolve, reject) => {
       const u = new URL(searchUrl);
       const client = u.protocol === 'https:' ? https : http;
-      const r = client.request({
-        hostname: u.hostname,
-        path: u.pathname + u.search,
-        method: 'GET',
-        headers,
-        timeout: 15_000
-      }, (resp) => {
-        let data = '';
-        let s = resp;
+      const r = client.request({ hostname: u.hostname, path: u.pathname + u.search, method: 'GET', headers, timeout: 15_000 }, (resp) => {
+        let data = ''; let s = resp;
         const enc = resp.headers['content-encoding'];
         if (enc === 'gzip') s = resp.pipe(zlib.createGunzip());
         else if (enc === 'deflate') s = resp.pipe(zlib.createInflate());
-        s.on('data', c => data += c);
-        s.on('end', () => resolve(data));
-        s.on('error', reject);
+        s.on('data', c => data += c); s.on('end', () => resolve(data)); s.on('error', reject);
       });
-      r.on('error', reject);
-      r.on('timeout', () => { r.destroy(); reject(new Error('Timeout')); });
-      r.end();
+      r.on('error', reject); r.on('timeout', () => { r.destroy(); reject(new Error('Timeout')); }); r.end();
     });
 
     const items = [];
-    // FIXED: was <<\/a>, now <\/a>
     const linkRe = /<a[^>]+class="[^"]*result__a[^"]*"[^>]+href="([^"]+)"[^>]*>([\s\S]*?)<<\/a>/g;
     const snipRe = /<a[^>]+class="[^"]*result__snippet[^"]*"[^>]*>([\s\S]*?)<<\/a>/g;
 
@@ -288,15 +218,13 @@ app.get('/search', async (req, res) => {
         if (uddg) href = decodeURIComponent(uddg[1]);
       }
       if (href.startsWith('//')) href = 'https:' + href;
-      const title = m[2].replace(/<<[^>]+>/g, '')
-        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      const title = m[2].replace(/<<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
       items.push({ title, href, snippet: '' });
     }
 
     let i = 0;
     while ((m = snipRe.exec(html)) !== null && i < items.length) {
-      items[i].snippet = m[1].replace(/<<[^>]+>/g, '')
-        .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
+      items[i].snippet = m[1].replace(/<<[^>]+>/g, '').replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').trim();
       i++;
     }
 
@@ -305,14 +233,6 @@ app.get('/search', async (req, res) => {
     console.error('[Search Error]', err);
     res.status(500).json({ error: 'Search failed', message: err.message });
   }
-});
-
-// Raw DDG HTML proxy
-app.get('/ddg', async (req, res) => {
-  const q = req.query.q;
-  if (!q) return res.status(400).json({ error: 'Missing ?q=' });
-  const target = `https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`;
-  try { await proxyPass(target, req, res); } catch (e) { console.error(e); }
 });
 
 app.use((err, req, res, next) => {
