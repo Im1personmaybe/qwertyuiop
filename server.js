@@ -50,13 +50,14 @@ function getProxyBase(req) {
   return `${proto}://${host}`;
 }
 
-function proxyUrl(target, req) {
-  const base = getProxyBase(req);
-  if (!target || target.startsWith('data:') || target.startsWith('blob:') || target.startsWith('javascript:') || target.startsWith('mailto:')) {
+function proxyUrl(target, baseUrl, req) {
+  if (!target || typeof target !== 'string') return target;
+  if (target.startsWith('data:') || target.startsWith('blob:') || target.startsWith('javascript:') || target.startsWith('mailto:') || target.startsWith('#')) {
     return target;
   }
+  const base = getProxyBase(req);
   try {
-    const u = new URL(target, req._targetOrigin || 'https://example.com');
+    const u = new URL(target, baseUrl);
     if (/youtube\.com|googlevideo\.com|ytimg\.com/.test(u.hostname)) {
       return `${base}/youtube/${u.href.replace(/^https?:\/\//, '')}`;
     }
@@ -81,21 +82,12 @@ function rewriteLocation(location, targetUrl, req) {
 
 function rewriteHTML(body, targetUrl, req) {
   const base = getProxyBase(req);
-  const origin = new URL(targetUrl).origin + '/';
+  let origin;
+  try { origin = new URL(targetUrl).origin + '/'; } catch { origin = targetUrl; }
 
-  // Helper to proxy any URL
-  const p = (url) => {
-    if (!url || url.startsWith('data:') || url.startsWith('blob:') || url.startsWith('javascript:') || url.startsWith('mailto:') || url.startsWith('#')) return url;
-    try {
-      const u = new URL(url, targetUrl);
-      if (/youtube\.com|googlevideo\.com|ytimg\.com/.test(u.hostname)) {
-        return `${base}/youtube/${u.href.replace(/^https?:\/\//, '')}`;
-      }
-      return `${base}/proxy?url=${encodeURIComponent(u.href)}`;
-    } catch { return url; }
-  };
+  const p = (url) => proxyUrl(url, targetUrl, req);
 
-  // 1. Inject <base> and patch script right after <head>
+  // Inject <base> and client-side patch immediately after <head>
   const patchScript = `<script>
 (function(){
   const PROXY_BASE = '${base}';
@@ -150,126 +142,78 @@ function rewriteHTML(body, targetUrl, req) {
     return _open.call(this, url ? pu(url) : url, name, features);
   };
 
-  // Patch location assignments (best effort)
-  let _loc = window.location;
-  Object.defineProperty(window, 'location', {
-    get: () => _loc,
-    set: (v) => { _loc.href = pu(v); }
-  });
-
-  // Intercept all clicks on <a> tags
-  document.addEventListener('click', function(e) {
-    const a = e.composedPath ? e.composedPath().find(el => el.tagName === 'A') : (e.target.closest ? e.target.closest('a') : null);
-    if (a && a.href && !a.href.startsWith('javascript:') && !a.href.startsWith('#')) {
-      const phref = pu(a.href);
-      if (phref !== a.href) {
-        a.href = phref;
-      }
-    }
-  }, true);
-
-  // Patch dynamic imports
-  const _import = __import__ || null;
-  if (_import) {
-    window.__import__ = function(specifier) {
-      return _import(pu(specifier));
-    };
-  }
-  // Patch import() if supported
-  try {
-    const _dynImport = eval('import');
-    const newImport = function(specifier) {
-      return _dynImport(pu(specifier));
-    };
-    // Can't override import() directly, but we can patch module scripts
-  } catch(e) {}
-
-  // Patch createElement for scripts/styles/iframes
+  // Patch createElement for scripts, links, images, iframes, media
   const _createEl = document.createElement;
   document.createElement = function(tag) {
     const el = _createEl.call(document, tag);
-    if (tag.toLowerCase() === 'script' || tag.toLowerCase() === 'link' || tag.toLowerCase() === 'iframe' || tag.toLowerCase() === 'img' || tag.toLowerCase() === 'video' || tag.toLowerCase() === 'audio' || tag.toLowerCase() === 'source') {
-      const desc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'src') || Object.getOwnPropertyDescriptor(el, 'src');
-      if (desc && desc.set) {
-        const orig = desc.set;
-        Object.defineProperty(el, 'src', {
-          set: function(v) { return orig.call(this, pu(v)); },
-          get: desc.get
-        });
+    const t = tag.toLowerCase();
+    if (['script','link','iframe','img','video','audio','source','embed','track'].includes(t)) {
+      const srcDesc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'src') || Object.getOwnPropertyDescriptor(el, 'src');
+      if (srcDesc && srcDesc.set) {
+        const orig = srcDesc.set;
+        Object.defineProperty(el, 'src', { set: function(v) { return orig.call(this, pu(v)); }, get: srcDesc.get });
       }
       const hrefDesc = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(el), 'href') || Object.getOwnPropertyDescriptor(el, 'href');
       if (hrefDesc && hrefDesc.set) {
         const orig = hrefDesc.set;
-        Object.defineProperty(el, 'href', {
-          set: function(v) { return orig.call(this, pu(v)); },
-          get: hrefDesc.get
-        });
+        Object.defineProperty(el, 'href', { set: function(v) { return orig.call(this, pu(v)); }, get: hrefDesc.get });
       }
     }
     return el;
   };
 
-  // Patch srcset
-  const _srcsetDesc = Object.getOwnPropertyDescriptor(Image.prototype, 'srcset') || Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'srcset');
-  if (_srcsetDesc && _srcsetDesc.set) {
-    const orig = _srcsetDesc.set;
-    Object.defineProperty(Image.prototype, 'srcset', {
-      set: function(v) {
-        if (typeof v === 'string') {
-          v = v.split(',').map(s => {
-            const parts = s.trim().split(/\\s+/);
-            parts[0] = pu(parts[0]);
-            return parts.join(' ');
-          }).join(', ');
-        }
-        return orig.call(this, v);
-      },
-      get: _srcsetDesc.get
-    });
-  }
+  // Intercept clicks on <a> tags
+  document.addEventListener('click', function(e) {
+    let a = e.target;
+    while (a && a.tagName !== 'A') a = a.parentElement;
+    if (a && a.href && !a.href.startsWith('javascript:') && !a.href.startsWith('#') && !a.href.startsWith(PROXY_BASE)) {
+      a.href = pu(a.href);
+    }
+  }, true);
 })();
 </script>`;
 
+  // Inject <base> and patch script after <head>
   body = body.replace(/<<head([^>]*)>/i, `<head$1><base href="${origin}">${patchScript}`);
 
-  // 2. Rewrite all URL attributes in HTML
-  const attrRe = /(href|src|action|data-src|poster|data-url|data-href|srcset|formaction|background|manifest|modulepreload|preload|cite|longdesc|profile|codebase|data)="([^"]*)"/gi;
-  body = body.replace(attrRe, (match, attr, url) => {
+  // If no <head>, prepend to <html> or start of body
+  if (!body.includes('<base href=')) {
+    body = body.replace(/<<html[^>]*>/i, `$&<<base href="${origin}">${patchScript}`);
+  }
+
+  // Rewrite all URL attributes (double and single quotes)
+  body = body.replace(/(href|src|action|data-src|poster|data-url|data-href|srcset|formaction|background|manifest|modulepreload|preload|cite|longdesc|profile|codebase|data)=["']([^"']*)["']/gi, (match, attr, url) => {
     return `${attr}="${p(url)}"`;
   });
 
-  // 3. Rewrite meta refresh
+  // Rewrite meta refresh
   body = body.replace(/<<meta[^>]+http-equiv=["']?refresh["']?[^>]*>/gi, (match) => {
     return match.replace(/content=["'](\d+);\s*url=([^"']+)["']/i, (m, delay, url) => {
       return `content="${delay};url=${p(url)}"`;
     });
   });
 
-  // 4. Rewrite inline styles
+  // Rewrite inline styles
   body = body.replace(/style=["']([^"']*)["']/gi, (match, style) => {
     return `style="${rewriteCSS(style, targetUrl, req)}"`;
   });
 
-  // 5. Rewrite <style> tags
+  // Rewrite <style> tags
   body = body.replace(/<<style[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
     return `<style>${rewriteCSS(css, targetUrl, req)}</style>`;
   });
 
-  // 6. Rewrite URLs inside inline scripts (basic string replacement)
+  // Rewrite inline scripts
   body = body.replace(/<<script([^>]*)>([\s\S]*?)<<\/script>/gi, (match, attrs, js) => {
-    if (attrs.includes('src=')) return match; // external script, already handled
+    if (attrs.includes('src=') || attrs.includes("src=")) return match;
     return `<script${attrs}>${rewriteJS(js, targetUrl, req)}</script>`;
   });
-
-  // 7. Rewrite protocol-relative URLs in text
-  body = body.replace(/url\(["']?\/\/([^"')]+)["']?\)/g, (m, u) => `url("${p('https://' + u)}")`);
 
   return body;
 }
 
 function rewriteCSS(css, targetUrl, req) {
   const base = getProxyBase(req);
-  const origin = new URL(targetUrl).origin;
 
   // url(...)
   css = css.replace(/url\(["']?([^"')]+)["']?\)/g, (match, url) => {
@@ -296,10 +240,8 @@ function rewriteCSS(css, targetUrl, req) {
 
 function rewriteJS(js, targetUrl, req) {
   const base = getProxyBase(req);
-  const origin = new URL(targetUrl).origin;
 
-  // These are best-effort regex replacements for common patterns
-  // fetch("url"), fetch('url')
+  // fetch("url")
   js = js.replace(/fetch\s*\(\s*["']([^"']+)["']\s*[,)]/g, (match, url) => {
     if (url.startsWith('data:') || url.startsWith('blob:')) return match;
     try {
@@ -328,7 +270,7 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // axios.get("url"), axios.post("url", ...)
+  // axios.get/post("url")
   js = js.replace(/axios\.(get|post|put|delete|patch|head|options)\s*\(\s*["']([^"']+)["']/g, (match, method, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -336,7 +278,7 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // importScripts("url") for Web Workers
+  // importScripts("url")
   js = js.replace(/importScripts\s*\(\s*["']([^"']+)["']\s*\)/g, (match, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -344,7 +286,7 @@ function rewriteJS(js, targetUrl, req) {
     } catch { return match; }
   });
 
-  // Worker("url")
+  // new Worker("url")
   js = js.replace(/new\s+Worker\s*\(\s*["']([^"']+)["']\s*\)/g, (match, url) => {
     try {
       const u = new URL(url, targetUrl);
@@ -365,15 +307,13 @@ function rewriteJS(js, targetUrl, req) {
 
 // ==================== PROXY ENGINE ====================
 
-async function proxyPass(targetUrl, req, res, opts = {}) {
+async function proxyPass(targetUrl, req, res) {
   return new Promise((resolve, reject) => {
     let url;
     try { url = new URL(targetUrl); } catch (e) {
       if (!res.headersSent) res.status(400).json({ error: 'Invalid URL' });
       return resolve();
     }
-
-    req._targetOrigin = url.origin;
 
     const client = url.protocol === 'https:' ? https : http;
     const headers = { ...BROWSER_HEADERS };
@@ -441,7 +381,7 @@ async function proxyPass(targetUrl, req, res, opts = {}) {
         let body = '';
         stream.on('data', c => body += c);
         stream.on('end', () => {
-          res.setHeader('Content-Type', ct.includes('javascript') ? proxyRes.headers['content-type'] : 'application/javascript; charset=utf-8');
+          res.setHeader('Content-Type', proxyRes.headers['content-type'] || 'application/javascript; charset=utf-8');
           res.send(rewriteJS(body, targetUrl, req));
           resolve();
         });
