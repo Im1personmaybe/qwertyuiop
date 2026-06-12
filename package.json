@@ -1,16 +1,17 @@
 {
   "name": "proxy-server",
   "version": "1.0.0",
-  "description": "Proxy backend for YouTube and DuckDuckGo",
+  "description": "Universal web proxy with search",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "express": "^4.19.2",
-    "cors": "^2.8.5"
+    "axios": "^1.7.2",
+    "cheerio": "^1.0.0-rc.12",
+    "express": "^4.19.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=18"
   }
 }
