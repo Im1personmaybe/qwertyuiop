@@ -90,6 +90,16 @@ function rewriteUrl(url, baseUrl) {
 }
 
 function rewriteHtml(html, baseUrl) {
+    // Remove <base> tags to prevent incorrect relative URL resolution
+    html = html.replace(/<<base[^>]*>/gi, '');
+
+    // Remove CSP meta tags
+    html = html.replace(/<<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+    html = html.replace(/<<meta[^>]*http-equiv=["']Content-Security-Policy-Report-Only["'][^>]*>/gi, '');
+
+    // Remove integrity attributes (rewritten scripts won't match the hash)
+    html = html.replace(/\s+integrity=["'][^"']*["']/gi, '');
+
     // Rewrite href attributes
     html = html.replace(/href=["']([^"']+)["']/gi, (match, url) => {
         return `href="${rewriteUrl(url, baseUrl)}"`;
@@ -140,14 +150,14 @@ function rewriteHtml(html, baseUrl) {
     });
 
     // Rewrite meta refresh
-    html = html.replace(/<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
+    html = html.replace(/<<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
         (match, delay, url) => {
             return `<meta http-equiv="refresh" content="${delay}; url=${rewriteUrl(url, baseUrl)}">`;
         }
     );
 
     // Rewrite CSS in style tags
-    html = html.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (match, css) => {
+    html = html.replace(/<<style[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
         return `<style>${rewriteCss(css, baseUrl)}</style>`;
     });
 
@@ -231,7 +241,7 @@ function rewriteJs(js, baseUrl) {
     });
 
     // Rewrite import statements
-    js = js.replace(/(import\s+(?:[^'"]*?|.*?)\s+from\s+["'])([^"']+)(["'])/g, (match, prefix, url, suffix) => {
+    js = js.replace(/(import\s+(?:[^'"]*?)\s+from\s+["'])([^"']+)(["'])/g, (match, prefix, url, suffix) => {
         return prefix + rewriteUrl(url, baseUrl) + suffix;
     });
 
@@ -307,6 +317,7 @@ async function handleBare(req, res) {
 // ============================================
 async function handleProxy(req, res) {
     const encodedUrl = req.url.slice(PREFIX.length).split('?')[0];
+    const requestQuery = req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : '';
     let targetUrl;
 
     try {
@@ -315,6 +326,11 @@ async function handleProxy(req, res) {
         res.writeHead(400);
         res.end('Invalid URL encoding');
         return;
+    }
+
+    // Merge request query string with target URL (fixes form GET submissions)
+    if (requestQuery) {
+        targetUrl += (targetUrl.includes('?') ? '&' : '?') + requestQuery.slice(1);
     }
 
     try {
@@ -355,6 +371,10 @@ async function handleProxy(req, res) {
                 delete proxyRes.headers['content-security-policy'];
                 delete proxyRes.headers['content-security-policy-report-only'];
                 delete proxyRes.headers['x-frame-options'];
+
+                // Fix CORS headers for the proxy origin
+                proxyRes.headers['access-control-allow-origin'] = '*';
+                delete proxyRes.headers['access-control-allow-credentials'];
 
                 // Only rewrite text content
                 const isText = contentType.includes('text/html') || 
@@ -401,14 +421,14 @@ async function handleProxy(req, res) {
 
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
         });
 
         req.pipe(proxyReq);
 
     } catch (err) {
         res.writeHead(400);
-        res.end(`<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
     }
 }
 
@@ -471,6 +491,10 @@ async function handleSimpleProxy(req, res) {
                 delete proxyRes.headers['content-security-policy-report-only'];
                 delete proxyRes.headers['x-frame-options'];
 
+                // Fix CORS headers for the proxy origin
+                proxyRes.headers['access-control-allow-origin'] = '*';
+                delete proxyRes.headers['access-control-allow-credentials'];
+
                 // Only rewrite text content
                 const isText = contentType.includes('text/html') || 
                               contentType.includes('text/css') || 
@@ -516,14 +540,14 @@ async function handleSimpleProxy(req, res) {
 
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
         });
 
         req.pipe(proxyReq);
 
     } catch (err) {
         res.writeHead(400);
-        res.end(`<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
     }
 }
 
@@ -531,7 +555,6 @@ async function handleSimpleProxy(req, res) {
 // STATIC FILES
 // ============================================
 const uvClientJs = `
-// UV Client - Intercepts browser APIs
 (function() {
     'use strict';
 
@@ -558,17 +581,39 @@ const uvClientJs = `
         return result;
     }
 
+    // Get original URL from current proxy path
+    function getOriginalUrl() {
+        try {
+            const encoded = location.pathname.slice(PREFIX.length).split('?')[0];
+            return xorDecode(encoded);
+        } catch(e) {
+            return location.href;
+        }
+    }
+
+    let currentUrl = getOriginalUrl();
+    let ORIGIN;
+    try {
+        ORIGIN = new URL(currentUrl).origin;
+    } catch(e) {
+        ORIGIN = location.origin;
+    }
+
     function rewriteUrl(url) {
         if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:')) return url;
         if (url.startsWith(PREFIX)) return url;
         try {
             let absoluteUrl = url;
             if (url.startsWith('//')) absoluteUrl = 'https:' + url;
-            else if (url.startsWith('/')) absoluteUrl = location.origin + url;
-            else if (!url.includes('://')) absoluteUrl = new URL(url, location.href).href;
+            else if (url.startsWith('/')) absoluteUrl = ORIGIN + url;
+            else if (!url.includes('://')) absoluteUrl = new URL(url, currentUrl).href;
+            else absoluteUrl = url;
             return PREFIX + xorEncode(absoluteUrl);
         } catch (e) { return url; }
     }
+
+    // Save original location before overriding
+    const originalLocation = window.location;
 
     // Override fetch
     const originalFetch = window.fetch;
@@ -596,32 +641,70 @@ const uvClientJs = `
     window.WebSocket.prototype = OriginalWebSocket.prototype;
 
     // Override window.location
-    let currentUrl = location.href;
     Object.defineProperty(window, 'location', {
         get: function() {
-            const loc = new URL(currentUrl);
+            const urlObj = new URL(currentUrl);
             const proxyLoc = {};
-            for (let key in loc) {
-                if (typeof loc[key] === 'function') {
-                    proxyLoc[key] = loc[key].bind(loc);
+            
+            // Copy URL properties
+            for (let key in urlObj) {
+                if (typeof urlObj[key] === 'function') {
+                    proxyLoc[key] = urlObj[key].bind(urlObj);
                 } else {
                     Object.defineProperty(proxyLoc, key, {
-                        get: () => loc[key],
+                        get: () => urlObj[key],
                         set: (val) => {
-                            if (key === 'href') {
-                                currentUrl = rewriteUrl(val);
-                                location.href = currentUrl;
+                            if (['href', 'pathname', 'search', 'hash'].includes(key)) {
+                                urlObj[key] = val;
+                                currentUrl = urlObj.href;
+                                originalLocation.href = PREFIX + xorEncode(currentUrl);
+                            } else {
+                                urlObj[key] = val;
                             }
                         }
                     });
                 }
             }
+            
+            // Add Location-specific methods
+            proxyLoc.assign = function(url) {
+                currentUrl = new URL(url, currentUrl).href;
+                originalLocation.assign(PREFIX + xorEncode(currentUrl));
+            };
+            proxyLoc.replace = function(url) {
+                currentUrl = new URL(url, currentUrl).href;
+                originalLocation.replace(PREFIX + xorEncode(currentUrl));
+            };
+            proxyLoc.reload = function(...args) {
+                originalLocation.reload(...args);
+            };
+            proxyLoc.toString = function() {
+                return currentUrl;
+            };
+            
             return proxyLoc;
         },
         set: function(url) {
-            location.href = rewriteUrl(url);
+            currentUrl = new URL(url, currentUrl).href;
+            originalLocation.href = PREFIX + xorEncode(currentUrl);
         }
     });
+
+    // Override URL constructor so relative URLs resolve against original page
+    const OriginalURL = window.URL;
+    window.URL = class extends OriginalURL {
+        constructor(url, base) {
+            if (base === undefined && typeof url === 'string' && !url.match(/^(data|blob|javascript):/i)) {
+                base = currentUrl;
+            }
+            super(url, base);
+        }
+    };
+    for (const key of Object.getOwnPropertyNames(OriginalURL)) {
+        if (typeof OriginalURL[key] === 'function') {
+            window.URL[key] = OriginalURL[key].bind(OriginalURL);
+        }
+    }
 
     // Override document.cookie
     const originalCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') || 
@@ -655,13 +738,28 @@ const uvClientJs = `
     const originalPushState = history.pushState;
     const originalReplaceState = history.replaceState;
     history.pushState = function(state, title, url) {
-        if (url) url = rewriteUrl(url);
+        if (url) {
+            currentUrl = new URL(url, currentUrl).href;
+            url = PREFIX + xorEncode(currentUrl);
+        }
         return originalPushState.call(this, state, title, url);
     };
     history.replaceState = function(state, title, url) {
-        if (url) url = rewriteUrl(url);
+        if (url) {
+            currentUrl = new URL(url, currentUrl).href;
+            url = PREFIX + xorEncode(currentUrl);
+        }
         return originalReplaceState.call(this, state, title, url);
     };
+
+    // Keep currentUrl in sync when user navigates back/forward
+    window.addEventListener('popstate', function() {
+        try {
+            const encoded = location.pathname.slice(PREFIX.length).split('?')[0];
+            currentUrl = xorDecode(encoded);
+            ORIGIN = new URL(currentUrl).origin;
+        } catch(e) {}
+    });
 
     // Override Worker
     const OriginalWorker = window.Worker;
@@ -691,14 +789,17 @@ const uvClientJs = `
         return new OriginalEventSource(rewriteUrl(url), options);
     };
 
-    // Intercept dynamic script injection
+    // Intercept dynamic element creation
     const originalCreateElement = Document.prototype.createElement;
     Document.prototype.createElement = function(tagName, options) {
         const element = originalCreateElement.call(this, tagName, options);
-        if (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'iframe' || tagName.toLowerCase() === 'link') {
+        const tag = tagName.toLowerCase();
+        if (tag === 'script' || tag === 'iframe' || tag === 'link' || tag === 'source' || tag === 'img' || tag === 'video' || tag === 'audio') {
             const originalSetAttribute = element.setAttribute;
             element.setAttribute = function(name, value) {
-                if (name === 'src' || name === 'href') value = rewriteUrl(value);
+                if (name === 'src' || name === 'href' || name === 'srcset' || name === 'data' || name === 'action' || name === 'formaction') {
+                    value = rewriteUrl(value);
+                }
                 return originalSetAttribute.call(this, name, value);
             };
         }
