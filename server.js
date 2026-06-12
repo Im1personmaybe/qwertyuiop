@@ -40,6 +40,29 @@ function xorDecode(str) {
 }
 
 // ============================================
+// HEADER CLEANER - Prevents Cloudflare Error 1000
+// ============================================
+function cleanHeaders(headers) {
+    const h = { ...headers };
+    
+    // Strip ALL Cloudflare and forwarding headers to prevent "DNS points to prohibited IP"
+    const blockedHeaders = [
+        'cf-ray', 'cf-visitor', 'cdn-loop', 'cf-connecting-ip',
+        'cf-ipcountry', 'cf-worker', 'cf-ew-via', 'cf-request-id',
+        'cf-bgj', 'cf-polished', 'cf-cache-status', 'cf-apo-via',
+        'cf-edge-cache', 'cf-features', 'cf-verification',
+        'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
+        'x-real-ip', 'true-client-ip', 'x-request-id'
+    ];
+    
+    for (const key of blockedHeaders) {
+        delete h[key];
+    }
+    
+    return h;
+}
+
+// ============================================
 // URL REWRITER
 // ============================================
 function rewriteUrl(url, baseUrl) {
@@ -102,14 +125,14 @@ function rewriteHtml(html, baseUrl) {
     });
 
     // Rewrite meta refresh
-    html = html.replace(/<<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
+    html = html.replace(/<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
         (match, delay, url) => {
             return `<meta http-equiv="refresh" content="${delay}; url=${rewriteUrl(url, baseUrl)}">`;
         }
     );
 
     // Rewrite CSS in style tags
-    html = html.replace(/<<style[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
+    html = html.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (match, css) => {
         return `<style>${rewriteCss(css, baseUrl)}</style>`;
     });
 
@@ -190,16 +213,12 @@ async function handleBare(req, res) {
             port: target.port || (target.protocol === 'https:' ? 443 : 80),
             path: target.pathname + target.search,
             method: req.method,
-            headers: { ...req.headers }
+            headers: cleanHeaders(req.headers),
+            servername: target.hostname
         };
 
         delete options.headers.host;
         options.headers.host = target.host;
-
-        // Remove problematic headers
-        delete options.headers['cf-ray'];
-        delete options.headers['cf-visitor'];
-        delete options.headers['cdn-loop'];
 
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
             res.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -240,7 +259,8 @@ async function handleProxy(req, res) {
             port: target.port || (target.protocol === 'https:' ? 443 : 80),
             path: target.pathname + target.search,
             method: req.method,
-            headers: { ...req.headers }
+            headers: cleanHeaders(req.headers),
+            servername: target.hostname
         };
 
         delete options.headers.host;
@@ -309,14 +329,14 @@ async function handleProxy(req, res) {
 
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<h1>Proxy Error</h1><p>${err.message}</p>`);
         });
 
         req.pipe(proxyReq);
 
     } catch (err) {
         res.writeHead(400);
-        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<h1>Error</h1><p>${err.message}</p>`);
     }
 }
 
@@ -347,16 +367,12 @@ async function handleSimpleProxy(req, res) {
             port: target.port || (target.protocol === 'https:' ? 443 : 80),
             path: target.pathname + target.search,
             method: req.method,
-            headers: { ...req.headers }
+            headers: cleanHeaders(req.headers),
+            servername: target.hostname
         };
 
         delete options.headers.host;
         options.headers.host = target.host;
-
-        // Remove problematic headers
-        delete options.headers['cf-ray'];
-        delete options.headers['cf-visitor'];
-        delete options.headers['cdn-loop'];
 
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, async (proxyRes) => {
             const contentType = proxyRes.headers['content-type'] || '';
@@ -421,14 +437,14 @@ async function handleSimpleProxy(req, res) {
 
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<h1>Proxy Error</h1><p>${err.message}</p>`);
         });
 
         req.pipe(proxyReq);
 
     } catch (err) {
         res.writeHead(400);
-        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<h1>Error</h1><p>${err.message}</p>`);
     }
 }
 
@@ -449,7 +465,7 @@ const uvClientJs = `
         for (let i = 0; i < str.length; i++) {
             result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
         }
-        return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+        return btoa(result).replace(/\\\\+/g, '-').replace(/\\\\//g, '_').replace(/=/g, '');
     }
 
     function xorDecode(str) {
@@ -760,7 +776,7 @@ const indexHtml = `<!DOCTYPE html>
             for (let i = 0; i < str.length; i++) {
                 result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
             }
-            return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+            return btoa(result).replace(/\\\\+/g, '-').replace(/\\\\//g, '_').replace(/=/g, '');
         }
 
         function go() {
