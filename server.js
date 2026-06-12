@@ -219,7 +219,7 @@ async function handleBare(req, res) {
 }
 
 // ============================================
-// PROXY REQUEST HANDLER
+// PROXY REQUEST HANDLER (XOR-encoded /service/...)
 // ============================================
 async function handleProxy(req, res) {
     const encodedUrl = req.url.slice(PREFIX.length).split('?')[0];
@@ -245,6 +245,118 @@ async function handleProxy(req, res) {
 
         delete options.headers.host;
         options.headers.host = target.host;
+
+        const proxyReq = (target.protocol === 'https:' ? https : http).request(options, async (proxyRes) => {
+            const contentType = proxyRes.headers['content-type'] || '';
+            let body = [];
+
+            proxyRes.on('data', chunk => body.push(chunk));
+            proxyRes.on('end', () => {
+                let data = Buffer.concat(body);
+
+                // Decompress if needed
+                const encoding = proxyRes.headers['content-encoding'];
+                if (encoding === 'gzip') {
+                    try { data = zlib.gunzipSync(data); } catch (e) {}
+                } else if (encoding === 'deflate') {
+                    try { data = zlib.inflateSync(data); } catch (e) {}
+                } else if (encoding === 'br') {
+                    try { data = zlib.brotliDecompressSync(data); } catch (e) {}
+                }
+
+                delete proxyRes.headers['content-encoding'];
+
+                // Only rewrite text content
+                const isText = contentType.includes('text/html') || 
+                              contentType.includes('text/css') || 
+                              contentType.includes('javascript') ||
+                              contentType.includes('/js');
+
+                if (isText) {
+                    let bodyStr = data.toString('utf-8');
+
+                    if (contentType.includes('text/html')) {
+                        bodyStr = rewriteHtml(bodyStr, targetUrl);
+                    } else if (contentType.includes('text/css')) {
+                        bodyStr = rewriteCss(bodyStr, targetUrl);
+                    } else if (contentType.includes('javascript') || contentType.includes('/js')) {
+                        bodyStr = rewriteJs(bodyStr, targetUrl);
+                    }
+
+                    // Rewrite Location headers
+                    if (proxyRes.headers.location) {
+                        proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                    }
+
+                    // Rewrite Set-Cookie domain/path
+                    if (proxyRes.headers['set-cookie']) {
+                        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
+                            return cookie.replace(/domain=[^;]+/, '').replace(/path=[^;]+/, 'path=/');
+                        });
+                    }
+
+                    const finalData = Buffer.from(bodyStr);
+                    proxyRes.headers['content-length'] = finalData.length;
+                    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                    res.end(finalData);
+                } else {
+                    // Binary data - pass through unchanged
+                    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                    res.end(data);
+                }
+            });
+        });
+
+        proxyReq.on('error', (err) => {
+            res.writeHead(502);
+            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
+        });
+
+        req.pipe(proxyReq);
+
+    } catch (err) {
+        res.writeHead(400);
+        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
+    }
+}
+
+// ============================================
+// SIMPLE QUERY-BASED PROXY (for /proxy?url=...)
+// ============================================
+async function handleSimpleProxy(req, res) {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    let targetUrl = url.searchParams.get('url');
+
+    if (!targetUrl) {
+        res.writeHead(400);
+        res.end(JSON.stringify({ error: 'Missing url parameter. Use /proxy?url=https://example.com' }));
+        return;
+    }
+
+    // Decode if URL-encoded
+    try {
+        targetUrl = decodeURIComponent(targetUrl);
+    } catch (e) {
+        // Already decoded or invalid, use as-is
+    }
+
+    try {
+        const target = new URL(targetUrl);
+        const options = {
+            hostname: target.hostname,
+            port: target.port || (target.protocol === 'https:' ? 443 : 80),
+            path: target.pathname + target.search,
+            method: req.method,
+            headers: { ...req.headers }
+        };
+
+        delete options.headers.host;
+        options.headers.host = target.host;
+
+        // Remove problematic headers
+        delete options.headers['cf-ray'];
+        delete options.headers['cf-visitor'];
+        delete options.headers['cdn-loop'];
 
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, async (proxyRes) => {
             const contentType = proxyRes.headers['content-type'] || '';
@@ -692,13 +804,19 @@ const server = http.createServer((req, res) => {
         return;
     }
 
+    // Simple query-based proxy (for /proxy?url=...)
+    if (cleanUrl === '/proxy') {
+        handleSimpleProxy(req, res);
+        return;
+    }
+
     // Bare server endpoint
     if (cleanUrl.startsWith(BARE_PREFIX)) {
         handleBare(req, res);
         return;
     }
 
-    // Proxy service
+    // Proxy service (XOR-encoded /service/...)
     if (cleanUrl.startsWith(PREFIX)) {
         handleProxy(req, res);
         return;
@@ -724,6 +842,7 @@ server.listen(PORT, () => {
 ║  Port:     ${PORT.toString().padEnd(31)} ║
 ║  Prefix:   ${PREFIX.padEnd(31)} ║
 ║  Bare:     ${BARE_PREFIX.padEnd(31)} ║
+║  Simple:   /proxy?url=...                ║
 ╚══════════════════════════════════════════╝
 Open: http://localhost:${PORT}
 `);
