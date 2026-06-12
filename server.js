@@ -52,11 +52,28 @@ function cleanHeaders(headers) {
         'cf-bgj', 'cf-polished', 'cf-cache-status', 'cf-apo-via',
         'cf-edge-cache', 'cf-features', 'cf-verification',
         'x-forwarded-for', 'x-forwarded-host', 'x-forwarded-proto',
-        'x-real-ip', 'true-client-ip', 'x-request-id'
+        'x-real-ip', 'true-client-ip', 'x-request-id',
+        'x-forwarded-server', 'x-http-host-override'
     ];
     
     for (const key of blockedHeaders) {
         delete h[key];
+    }
+    
+    // Spoof a real browser user-agent if missing or suspicious
+    if (!h['user-agent'] || h['user-agent'].includes('node')) {
+        h['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+    }
+    
+    // Add Accept headers if missing
+    if (!h['accept']) {
+        h['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
+    }
+    if (!h['accept-language']) {
+        h['accept-language'] = 'en-US,en;q=0.9';
+    }
+    if (!h['accept-encoding']) {
+        h['accept-encoding'] = 'gzip, deflate, br';
     }
     
     return h;
@@ -66,7 +83,8 @@ function cleanHeaders(headers) {
 // URL REWRITER
 // ============================================
 function rewriteUrl(url, baseUrl) {
-    if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:')) {
+    if (!url || typeof url !== 'string') return url;
+    if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:') || url.startsWith('mailto:')) {
         return url;
     }
     if (url.startsWith(PREFIX)) return url;
@@ -91,14 +109,20 @@ function rewriteUrl(url, baseUrl) {
 
 function rewriteHtml(html, baseUrl) {
     // Remove <base> tags to prevent incorrect relative URL resolution
-    html = html.replace(/<<base[^>]*>/gi, '');
+    html = html.replace(/<<base\b[^>]*>/gi, '');
 
     // Remove CSP meta tags
-    html = html.replace(/<<meta[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
-    html = html.replace(/<<meta[^>]*http-equiv=["']Content-Security-Policy-Report-Only["'][^>]*>/gi, '');
+    html = html.replace(/<<meta\b[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+    html = html.replace(/<<meta\b[^>]*http-equiv=["']Content-Security-Policy-Report-Only["'][^>]*>/gi, '');
 
     // Remove integrity attributes (rewritten scripts won't match the hash)
     html = html.replace(/\s+integrity=["'][^"']*["']/gi, '');
+    
+    // Remove crossorigin attributes
+    html = html.replace(/\s+crossorigin=["'][^"']*["']/gi, '');
+    
+    // Remove referrerpolicy attributes
+    html = html.replace(/\s+referrerpolicy=["'][^"']*["']/gi, '');
 
     // Rewrite href attributes
     html = html.replace(/href=["']([^"']+)["']/gi, (match, url) => {
@@ -113,8 +137,14 @@ function rewriteHtml(html, baseUrl) {
     // Rewrite srcset attributes
     html = html.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
         const rewritten = srcset.split(',').map(part => {
-            const [url, descriptor] = part.trim().split(/\s+/);
-            return rewriteUrl(url, baseUrl) + (descriptor ? ' ' + descriptor : '');
+            const trimmed = part.trim();
+            const spaceIdx = trimmed.search(/\s/);
+            if (spaceIdx === -1) {
+                return rewriteUrl(trimmed, baseUrl);
+            }
+            const url = trimmed.slice(0, spaceIdx);
+            const descriptor = trimmed.slice(spaceIdx);
+            return rewriteUrl(url, baseUrl) + descriptor;
         }).join(', ');
         return `srcset="${rewritten}"`;
     });
@@ -140,7 +170,7 @@ function rewriteHtml(html, baseUrl) {
     });
 
     // Rewrite data attributes (object, etc.)
-    html = html.replace(/data=["']([^"']+)["']/gi, (match, url) => {
+    html = html.replace(/\bdata=["']([^"']+)["']/gi, (match, url) => {
         return `data="${rewriteUrl(url, baseUrl)}"`;
     });
 
@@ -148,16 +178,41 @@ function rewriteHtml(html, baseUrl) {
     html = html.replace(/manifest=["']([^"']+)["']/gi, (match, url) => {
         return `manifest="${rewriteUrl(url, baseUrl)}"`;
     });
+    
+    // Rewrite cite attributes (blockquote, q, del, ins)
+    html = html.replace(/cite=["']([^"']+)["']/gi, (match, url) => {
+        return `cite="${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite longdesc attributes
+    html = html.replace(/longdesc=["']([^"']+)["']/gi, (match, url) => {
+        return `longdesc="${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite profile attributes (head)
+    html = html.replace(/profile=["']([^"']+)["']/gi, (match, url) => {
+        return `profile="${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite dynsrc attributes (deprecated but still used)
+    html = html.replace(/dynsrc=["']([^"']+)["']/gi, (match, url) => {
+        return `dynsrc="${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite lowsrc attributes (deprecated but still used)
+    html = html.replace(/lowsrc=["']([^"']+)["']/gi, (match, url) => {
+        return `lowsrc="${rewriteUrl(url, baseUrl)}"`;
+    });
 
     // Rewrite meta refresh
-    html = html.replace(/<<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
+    html = html.replace(/<<meta\b[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
         (match, delay, url) => {
             return `<meta http-equiv="refresh" content="${delay}; url=${rewriteUrl(url, baseUrl)}">`;
         }
     );
 
     // Rewrite CSS in style tags
-    html = html.replace(/<<style[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
+    html = html.replace(/<<style\b[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
         return `<style>${rewriteCss(css, baseUrl)}</style>`;
     });
 
@@ -166,9 +221,11 @@ function rewriteHtml(html, baseUrl) {
         return `style="${rewriteCss(css, baseUrl)}"`;
     });
 
-    // Inject UV client script
+    // Inject UV client script at the very beginning of <head> or before </head>
     const uvScript = `<script src="/uv/uv.client.js"></script>`;
-    if (html.includes('</head>')) {
+    if (html.includes('<head>')) {
+        html = html.replace('<head>', '<head>' + uvScript);
+    } else if (html.includes('</head>')) {
         html = html.replace('</head>', uvScript + '</head>');
     } else if (html.includes('<body')) {
         html = html.replace('<body', uvScript + '<body');
@@ -180,14 +237,19 @@ function rewriteHtml(html, baseUrl) {
 }
 
 function rewriteCss(css, baseUrl) {
-    // Rewrite url() references
-    css = css.replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, (match, url) => {
+    // Rewrite url() references - more robust regex
+    css = css.replace(/url\(\s*["']?([^"')\s]+)["']?\s*\)/gi, (match, url) => {
         return `url("${rewriteUrl(url.trim(), baseUrl)}")`;
     });
 
     // Rewrite @import with quotes
     css = css.replace(/@import\s+["']([^"']+)["']/gi, (match, url) => {
         return `@import "${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite @import with url()
+    css = css.replace(/@import\s+url\(\s*["']?([^"')\s]+)["']?\s*\)/gi, (match, url) => {
+        return `@import url("${rewriteUrl(url.trim(), baseUrl)}")`;
     });
 
     return css;
@@ -199,14 +261,26 @@ function rewriteJs(js, baseUrl) {
         return `fetch("${rewriteUrl(url, baseUrl)}"`;
     });
 
-    // Rewrite fetch with template literals (basic)
+    // Rewrite fetch with template literals
     js = js.replace(/fetch\s*\(\s*`([^`]+)`/g, (match, url) => {
         return `fetch(\`${rewriteUrl(url, baseUrl)}\``;
+    });
+    
+    // Rewrite fetch with variables (basic)
+    js = js.replace(/fetch\s*\(\s*([^"',]+)/g, (match, url) => {
+        if (url.trim().startsWith('"') || url.trim().startsWith("'") || url.trim().startsWith('`')) return match;
+        return `fetch(__uv.rewriteUrl(${url})`;
     });
 
     // Rewrite XMLHttpRequest.open
     js = js.replace(/\.open\s*\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']/g, (match, method, url) => {
         return `.open("${method}", "${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite XMLHttpRequest.open with variables
+    js = js.replace(/\.open\s*\(\s*["']([^"']+)["']\s*,\s*([^)]+)/g, (match, method, url) => {
+        if (url.trim().startsWith('"') || url.trim().startsWith("'") || url.trim().startsWith('`')) return match;
+        return `.open("${method}", __uv.rewriteUrl(${url})`;
     });
 
     // Rewrite WebSocket
@@ -233,6 +307,12 @@ function rewriteJs(js, baseUrl) {
     // Rewrite window.open
     js = js.replace(/window\.open\s*\(\s*["']([^"']+)["']/g, (match, url) => {
         return `window.open("${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite window.open with variables
+    js = js.replace(/window\.open\s*\(\s*([^)]+)/g, (match, url) => {
+        if (url.trim().startsWith('"') || url.trim().startsWith("'") || url.trim().startsWith('`')) return match;
+        return `window.open(__uv.rewriteUrl(${url})`;
     });
 
     // Rewrite navigator.sendBeacon
@@ -263,6 +343,33 @@ function rewriteJs(js, baseUrl) {
     // Rewrite jQuery ajax calls
     js = js.replace(/\$\.(get|post|ajax)\s*\(\s*["']([^"']+)["']/g, (match, method, url) => {
         return `$.${method}("${rewriteUrl(url, baseUrl)}"`;
+    });
+    
+    // Rewrite jQuery load
+    js = js.replace(/\$\(.*\)\.load\s*\(\s*["']([^"']+)["']/g, (match, url) => {
+        return match.replace(url, rewriteUrl(url, baseUrl));
+    });
+    
+    // Rewrite jQuery getJSON/getScript
+    js = js.replace(/\$\.(getJSON|getScript)\s*\(\s*["']([^"']+)["']/g, (match, method, url) => {
+        return `$.${method}("${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite cache.add / cache.addAll
+    js = js.replace(/cache\.add\s*\(\s*["']([^"']+)["']/g, (match, url) => {
+        return `cache.add("${rewriteUrl(url, baseUrl)}"`;
+    });
+    js = js.replace(/cache\.addAll\s*\(\s*\[([^\]]*)\]/g, (match, urls) => {
+        const rewritten = urls.split(',').map(u => {
+            const trimmed = u.trim();
+            if (trimmed.startsWith('"') || trimmed.startsWith("'")) {
+                const quote = trimmed[0];
+                const inner = trimmed.slice(1, -1);
+                return `${quote}${rewriteUrl(inner, baseUrl)}${quote}`;
+            }
+            return u;
+        }).join(', ');
+        return `cache.addAll([${rewritten}]`;
     });
 
     return js;
@@ -371,6 +478,11 @@ async function handleProxy(req, res) {
                 delete proxyRes.headers['content-security-policy'];
                 delete proxyRes.headers['content-security-policy-report-only'];
                 delete proxyRes.headers['x-frame-options'];
+                delete proxyRes.headers['frame-options'];
+                delete proxyRes.headers['x-content-type-options'];
+                delete proxyRes.headers['referrer-policy'];
+                delete proxyRes.headers['permissions-policy'];
+                delete proxyRes.headers['feature-policy'];
 
                 // Fix CORS headers for the proxy origin
                 proxyRes.headers['access-control-allow-origin'] = '*';
@@ -381,7 +493,8 @@ async function handleProxy(req, res) {
                               contentType.includes('text/css') || 
                               contentType.includes('javascript') ||
                               contentType.includes('ecmascript') ||
-                              contentType.includes('/js');
+                              contentType.includes('/js') ||
+                              contentType.includes('application/json');
 
                 if (isText) {
                     let bodyStr = data.toString('utf-8');
@@ -394,15 +507,28 @@ async function handleProxy(req, res) {
                         bodyStr = rewriteJs(bodyStr, targetUrl);
                     }
 
-                    // Rewrite Location headers
+                    // Rewrite Location headers - CRITICAL for OAuth redirects
                     if (proxyRes.headers.location) {
-                        proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                        const rewrittenLoc = rewriteUrl(proxyRes.headers.location, targetUrl);
+                        proxyRes.headers.location = rewrittenLoc;
+                    }
+
+                    // Rewrite Refresh headers
+                    if (proxyRes.headers.refresh) {
+                        const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
+                        if (refreshMatch) {
+                            proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
+                        }
                     }
 
                     // Rewrite Set-Cookie domain/path
                     if (proxyRes.headers['set-cookie']) {
                         proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
-                            return cookie.replace(/domain=[^;]+/, '').replace(/path=[^;]+/, 'path=/');
+                            return cookie
+                                .replace(/domain=[^;]+/gi, '')
+                                .replace(/path=[^;]+/gi, 'path=/')
+                                .replace(/secure/gi, '')
+                                .replace(/samesite=[^;]+/gi, '');
                         });
                     }
 
@@ -490,6 +616,11 @@ async function handleSimpleProxy(req, res) {
                 delete proxyRes.headers['content-security-policy'];
                 delete proxyRes.headers['content-security-policy-report-only'];
                 delete proxyRes.headers['x-frame-options'];
+                delete proxyRes.headers['frame-options'];
+                delete proxyRes.headers['x-content-type-options'];
+                delete proxyRes.headers['referrer-policy'];
+                delete proxyRes.headers['permissions-policy'];
+                delete proxyRes.headers['feature-policy'];
 
                 // Fix CORS headers for the proxy origin
                 proxyRes.headers['access-control-allow-origin'] = '*';
@@ -500,7 +631,8 @@ async function handleSimpleProxy(req, res) {
                               contentType.includes('text/css') || 
                               contentType.includes('javascript') ||
                               contentType.includes('ecmascript') ||
-                              contentType.includes('/js');
+                              contentType.includes('/js') ||
+                              contentType.includes('application/json');
 
                 if (isText) {
                     let bodyStr = data.toString('utf-8');
@@ -517,11 +649,23 @@ async function handleSimpleProxy(req, res) {
                     if (proxyRes.headers.location) {
                         proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
                     }
+                    
+                    // Rewrite Refresh headers
+                    if (proxyRes.headers.refresh) {
+                        const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
+                        if (refreshMatch) {
+                            proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
+                        }
+                    }
 
                     // Rewrite Set-Cookie domain/path
                     if (proxyRes.headers['set-cookie']) {
                         proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
-                            return cookie.replace(/domain=[^;]+/, '').replace(/path=[^;]+/, 'path=/');
+                            return cookie
+                                .replace(/domain=[^;]+/gi, '')
+                                .replace(/path=[^;]+/gi, 'path=/')
+                                .replace(/secure/gi, '')
+                                .replace(/samesite=[^;]+/gi, '');
                         });
                     }
 
@@ -567,7 +711,7 @@ const uvClientJs = `
         for (let i = 0; i < str.length; i++) {
             result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
         }
-        return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
+        return btoa(result).replace(/\\\\+/g, '-').replace(/\\\\//g, '_').replace(/=/g, '');
     }
 
     function xorDecode(str) {
@@ -600,7 +744,8 @@ const uvClientJs = `
     }
 
     function rewriteUrl(url) {
-        if (!url || url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:')) return url;
+        if (!url || typeof url !== 'string') return url;
+        if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:') || url.startsWith('mailto:')) return url;
         if (url.startsWith(PREFIX)) return url;
         try {
             let absoluteUrl = url;
@@ -612,8 +757,91 @@ const uvClientJs = `
         } catch (e) { return url; }
     }
 
+    // Expose rewriteUrl globally for inline scripts
+    window.__uv = { rewriteUrl: rewriteUrl };
+
     // Save original location before overriding
     const originalLocation = window.location;
+    const originalURL = window.URL;
+
+    // Create proxy location object
+    const urlObj = new URL(currentUrl);
+    const proxyLoc = {};
+    
+    const locProps = ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin', 'username', 'password'];
+    
+    locProps.forEach(key => {
+        Object.defineProperty(proxyLoc, key, {
+            get: () => urlObj[key],
+            set: (val) => {
+                urlObj[key] = val;
+                currentUrl = urlObj.href;
+                ORIGIN = urlObj.origin;
+                if (key === 'href') {
+                    originalLocation.href = PREFIX + xorEncode(currentUrl);
+                }
+            }
+        });
+    });
+    
+    // Add Location methods
+    proxyLoc.assign = function(url) {
+        currentUrl = new URL(url, currentUrl).href;
+        originalLocation.assign(PREFIX + xorEncode(currentUrl));
+    };
+    proxyLoc.replace = function(url) {
+        currentUrl = new URL(url, currentUrl).href;
+        originalLocation.replace(PREFIX + xorEncode(currentUrl));
+    };
+    proxyLoc.reload = function(...args) {
+        originalLocation.reload(...args);
+    };
+    proxyLoc.toString = function() {
+        return currentUrl;
+    };
+
+    // Override window.location with Proxy
+    Object.defineProperty(window, 'location', {
+        get: () => proxyLoc,
+        set: (url) => {
+            currentUrl = new URL(url, currentUrl).href;
+            originalLocation.href = PREFIX + xorEncode(currentUrl);
+        }
+    });
+
+    // Override document.location
+    try {
+        Object.defineProperty(document, 'location', {
+            get: () => proxyLoc,
+            set: (url) => {
+                currentUrl = new URL(url, currentUrl).href;
+                originalLocation.href = PREFIX + xorEncode(currentUrl);
+            }
+        });
+    } catch(e) {}
+
+    // Override URL constructor so relative URLs resolve against original page
+    window.URL = class extends originalURL {
+        constructor(url, base) {
+            if (base === undefined && typeof url === 'string' && !url.match(/^(data|blob|javascript|mailto):/i)) {
+                base = currentUrl;
+            }
+            super(url, base);
+        }
+    };
+    for (const key of Object.getOwnPropertyNames(originalURL)) {
+        if (typeof originalURL[key] === 'function' && key !== 'prototype') {
+            window.URL[key] = originalURL[key].bind(originalURL);
+        }
+    }
+
+    // Override document.domain to match original site (helps with iframe detection)
+    try {
+        Object.defineProperty(document, 'domain', {
+            get: () => new URL(currentUrl).hostname,
+            set: () => {}
+        });
+    } catch(e) {}
 
     // Override fetch
     const originalFetch = window.fetch;
@@ -639,72 +867,6 @@ const uvClientJs = `
         return new OriginalWebSocket(rewritten, protocols);
     };
     window.WebSocket.prototype = OriginalWebSocket.prototype;
-
-    // Override window.location
-    Object.defineProperty(window, 'location', {
-        get: function() {
-            const urlObj = new URL(currentUrl);
-            const proxyLoc = {};
-            
-            // Copy URL properties
-            for (let key in urlObj) {
-                if (typeof urlObj[key] === 'function') {
-                    proxyLoc[key] = urlObj[key].bind(urlObj);
-                } else {
-                    Object.defineProperty(proxyLoc, key, {
-                        get: () => urlObj[key],
-                        set: (val) => {
-                            if (['href', 'pathname', 'search', 'hash'].includes(key)) {
-                                urlObj[key] = val;
-                                currentUrl = urlObj.href;
-                                originalLocation.href = PREFIX + xorEncode(currentUrl);
-                            } else {
-                                urlObj[key] = val;
-                            }
-                        }
-                    });
-                }
-            }
-            
-            // Add Location-specific methods
-            proxyLoc.assign = function(url) {
-                currentUrl = new URL(url, currentUrl).href;
-                originalLocation.assign(PREFIX + xorEncode(currentUrl));
-            };
-            proxyLoc.replace = function(url) {
-                currentUrl = new URL(url, currentUrl).href;
-                originalLocation.replace(PREFIX + xorEncode(currentUrl));
-            };
-            proxyLoc.reload = function(...args) {
-                originalLocation.reload(...args);
-            };
-            proxyLoc.toString = function() {
-                return currentUrl;
-            };
-            
-            return proxyLoc;
-        },
-        set: function(url) {
-            currentUrl = new URL(url, currentUrl).href;
-            originalLocation.href = PREFIX + xorEncode(currentUrl);
-        }
-    });
-
-    // Override URL constructor so relative URLs resolve against original page
-    const OriginalURL = window.URL;
-    window.URL = class extends OriginalURL {
-        constructor(url, base) {
-            if (base === undefined && typeof url === 'string' && !url.match(/^(data|blob|javascript):/i)) {
-                base = currentUrl;
-            }
-            super(url, base);
-        }
-    };
-    for (const key of Object.getOwnPropertyNames(OriginalURL)) {
-        if (typeof OriginalURL[key] === 'function') {
-            window.URL[key] = OriginalURL[key].bind(OriginalURL);
-        }
-    }
 
     // Override document.cookie
     const originalCookie = Object.getOwnPropertyDescriptor(Document.prototype, 'cookie') || 
@@ -758,6 +920,11 @@ const uvClientJs = `
             const encoded = location.pathname.slice(PREFIX.length).split('?')[0];
             currentUrl = xorDecode(encoded);
             ORIGIN = new URL(currentUrl).origin;
+            // Update urlObj
+            const newUrl = new URL(currentUrl);
+            locProps.forEach(key => {
+                urlObj[key] = newUrl[key];
+            });
         } catch(e) {}
     });
 
@@ -789,21 +956,61 @@ const uvClientJs = `
         return new OriginalEventSource(rewriteUrl(url), options);
     };
 
+    // Override navigator.sendBeacon
+    const originalSendBeacon = navigator.sendBeacon;
+    navigator.sendBeacon = function(url, data) {
+        return originalSendBeacon.call(this, rewriteUrl(url), data);
+    };
+
     // Intercept dynamic element creation
     const originalCreateElement = Document.prototype.createElement;
     Document.prototype.createElement = function(tagName, options) {
         const element = originalCreateElement.call(this, tagName, options);
         const tag = tagName.toLowerCase();
-        if (tag === 'script' || tag === 'iframe' || tag === 'link' || tag === 'source' || tag === 'img' || tag === 'video' || tag === 'audio') {
+        if (tag === 'script' || tag === 'iframe' || tag === 'link' || tag === 'source' || 
+            tag === 'img' || tag === 'video' || tag === 'audio' || tag === 'embed' || 
+            tag === 'object' || tag === 'track') {
             const originalSetAttribute = element.setAttribute;
             element.setAttribute = function(name, value) {
-                if (name === 'src' || name === 'href' || name === 'srcset' || name === 'data' || name === 'action' || name === 'formaction') {
+                if (name === 'src' || name === 'href' || name === 'srcset' || 
+                    name === 'data' || name === 'action' || name === 'formaction' ||
+                    name === 'poster' || name === 'background' || name === 'cite' ||
+                    name === 'longdesc' || name === 'profile' || name === 'dynsrc' ||
+                    name === 'lowsrc') {
                     value = rewriteUrl(value);
                 }
                 return originalSetAttribute.call(this, name, value);
             };
         }
         return element;
+    };
+    
+    // Intercept src property setters on existing elements
+    const originalSrcSetter = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (originalSrcSetter && originalSrcSetter.set) {
+        Object.defineProperty(HTMLImageElement.prototype, 'src', {
+            get: originalSrcSetter.get,
+            set: function(val) {
+                originalSrcSetter.set.call(this, rewriteUrl(val));
+            }
+        });
+    }
+    
+    const originalHrefSetter = Object.getOwnPropertyDescriptor(HTMLAnchorElement.prototype, 'href');
+    if (originalHrefSetter && originalHrefSetter.set) {
+        Object.defineProperty(HTMLAnchorElement.prototype, 'href', {
+            get: originalHrefSetter.get,
+            set: function(val) {
+                originalHrefSetter.set.call(this, rewriteUrl(val));
+            }
+        });
+    }
+
+    // Override window.open more thoroughly
+    const originalOpen = window.open;
+    window.open = function(url, target, features) {
+        if (url) url = rewriteUrl(url);
+        return originalOpen.call(this, url, target, features);
     };
 
     console.log('[UV] Client initialized');
