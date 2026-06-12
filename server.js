@@ -24,13 +24,14 @@ function xorEncode(str) {
     for (let i = 0; i < str.length; i++) {
         result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
     }
-    return btoa(result).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+    return Buffer.from(result, 'binary').toString('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 }
 
 function xorDecode(str) {
     str = str.replace(/-/g, '+').replace(/_/g, '/');
     while (str.length % 4) str += '=';
-    const decoded = atob(str);
+    const decoded = Buffer.from(str, 'base64').toString('binary');
     let result = '';
     for (let i = 0; i < decoded.length; i++) {
         result += String.fromCharCode(decoded.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
@@ -101,14 +102,14 @@ function rewriteHtml(html, baseUrl) {
     });
 
     // Rewrite meta refresh
-    html = html.replace(/<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
+    html = html.replace(/<<meta[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
         (match, delay, url) => {
             return `<meta http-equiv="refresh" content="${delay}; url=${rewriteUrl(url, baseUrl)}">`;
         }
     );
 
     // Rewrite CSS in style tags
-    html = html.replace(/<style[^>]*>([\s\S]*?)<\/style>/gi, (match, css) => {
+    html = html.replace(/<<style[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
         return `<style>${rewriteCss(css, baseUrl)}</style>`;
     });
 
@@ -221,7 +222,7 @@ async function handleBare(req, res) {
 // PROXY REQUEST HANDLER
 // ============================================
 async function handleProxy(req, res) {
-    const encodedUrl = req.url.slice(PREFIX.length);
+    const encodedUrl = req.url.slice(PREFIX.length).split('?')[0];
     let targetUrl;
 
     try {
@@ -245,11 +246,6 @@ async function handleProxy(req, res) {
         delete options.headers.host;
         options.headers.host = target.host;
 
-        // Forward cookies properly
-        if (options.headers.cookie) {
-            options.headers.cookie = options.headers.cookie;
-        }
-
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, async (proxyRes) => {
             const contentType = proxyRes.headers['content-type'] || '';
             let body = [];
@@ -268,50 +264,59 @@ async function handleProxy(req, res) {
                     try { data = zlib.brotliDecompressSync(data); } catch (e) {}
                 }
 
-                // Remove content-encoding since we decompressed
                 delete proxyRes.headers['content-encoding'];
 
-                let bodyStr = data.toString('utf-8');
+                // Only rewrite text content
+                const isText = contentType.includes('text/html') || 
+                              contentType.includes('text/css') || 
+                              contentType.includes('javascript') ||
+                              contentType.includes('/js');
 
-                // Rewrite based on content type
-                if (contentType.includes('text/html')) {
-                    bodyStr = rewriteHtml(bodyStr, targetUrl);
-                } else if (contentType.includes('text/css')) {
-                    bodyStr = rewriteCss(bodyStr, targetUrl);
-                } else if (contentType.includes('javascript') || contentType.includes('js')) {
-                    bodyStr = rewriteJs(bodyStr, targetUrl);
+                if (isText) {
+                    let bodyStr = data.toString('utf-8');
+
+                    if (contentType.includes('text/html')) {
+                        bodyStr = rewriteHtml(bodyStr, targetUrl);
+                    } else if (contentType.includes('text/css')) {
+                        bodyStr = rewriteCss(bodyStr, targetUrl);
+                    } else if (contentType.includes('javascript') || contentType.includes('/js')) {
+                        bodyStr = rewriteJs(bodyStr, targetUrl);
+                    }
+
+                    // Rewrite Location headers
+                    if (proxyRes.headers.location) {
+                        proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                    }
+
+                    // Rewrite Set-Cookie domain/path
+                    if (proxyRes.headers['set-cookie']) {
+                        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
+                            return cookie.replace(/domain=[^;]+/, '').replace(/path=[^;]+/, 'path=/');
+                        });
+                    }
+
+                    const finalData = Buffer.from(bodyStr);
+                    proxyRes.headers['content-length'] = finalData.length;
+                    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                    res.end(finalData);
+                } else {
+                    // Binary data - pass through unchanged
+                    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+                    res.end(data);
                 }
-
-                // Rewrite Location headers
-                if (proxyRes.headers.location) {
-                    proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
-                }
-
-                // Rewrite Set-Cookie domain/path
-                if (proxyRes.headers['set-cookie']) {
-                    proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
-                        return cookie.replace(/domain=[^;]+/, '').replace(/path=[^;]+/, 'path=/');
-                    });
-                }
-
-                // Update content-length
-                const finalData = Buffer.from(bodyStr);
-                proxyRes.headers['content-length'] = finalData.length;
-
-                res.writeHead(proxyRes.statusCode, proxyRes.headers);
-                res.end(finalData);
             });
         });
 
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
         });
 
         req.pipe(proxyReq);
+
     } catch (err) {
         res.writeHead(400);
-        res.end(`<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
     }
 }
 
@@ -332,7 +337,7 @@ const uvClientJs = `
         for (let i = 0; i < str.length; i++) {
             result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
         }
-        return btoa(result).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+        return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
     }
 
     function xorDecode(str) {
@@ -643,7 +648,7 @@ const indexHtml = `<!DOCTYPE html>
             for (let i = 0; i < str.length; i++) {
                 result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
             }
-            return btoa(result).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+            return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
         }
 
         function go() {
@@ -666,7 +671,7 @@ const indexHtml = `<!DOCTYPE html>
 // MAIN SERVER
 // ============================================
 const server = http.createServer((req, res) => {
-    const url = req.url;
+    const cleanUrl = req.url.split('?')[0];
 
     // CORS headers
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -680,26 +685,27 @@ const server = http.createServer((req, res) => {
         return;
     }
 
-    // Bare server endpoint
-    if (url.startsWith(BARE_PREFIX)) {
-        handleBare(req, res);
-        return;
-    }
-
-    // Proxy service
-    if (url.startsWith(PREFIX)) {
-        handleProxy(req, res);
-        return;
-    }
-
-    // Static files
-    if (url === '/uv/uv.client.js') {
+    // Serve UV client script BEFORE proxy check
+    if (cleanUrl === '/uv/uv.client.js') {
         res.writeHead(200, { 'Content-Type': 'application/javascript' });
         res.end(uvClientJs);
         return;
     }
 
-    if (url === '/' || url === '/index.html') {
+    // Bare server endpoint
+    if (cleanUrl.startsWith(BARE_PREFIX)) {
+        handleBare(req, res);
+        return;
+    }
+
+    // Proxy service
+    if (cleanUrl.startsWith(PREFIX)) {
+        handleProxy(req, res);
+        return;
+    }
+
+    // Static files
+    if (cleanUrl === '/' || cleanUrl === '/index.html') {
         res.writeHead(200, { 'Content-Type': 'text/html' });
         res.end(indexHtml);
         return;
