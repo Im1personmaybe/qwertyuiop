@@ -45,7 +45,7 @@ function xorDecode(str) {
 function cleanHeaders(headers) {
     const h = { ...headers };
     
-    // Strip ALL Cloudflare and forwarding headers to prevent "DNS points to prohibited IP"
+    // Strip ALL Cloudflare and forwarding headers
     const blockedHeaders = [
         'cf-ray', 'cf-visitor', 'cdn-loop', 'cf-connecting-ip',
         'cf-ipcountry', 'cf-worker', 'cf-ew-via', 'cf-request-id',
@@ -100,9 +100,23 @@ function rewriteHtml(html, baseUrl) {
         return `src="${rewriteUrl(url, baseUrl)}"`;
     });
 
+    // Rewrite srcset attributes
+    html = html.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
+        const rewritten = srcset.split(',').map(part => {
+            const [url, descriptor] = part.trim().split(/\s+/);
+            return rewriteUrl(url, baseUrl) + (descriptor ? ' ' + descriptor : '');
+        }).join(', ');
+        return `srcset="${rewritten}"`;
+    });
+
     // Rewrite action attributes
     html = html.replace(/action=["']([^"']+)["']/gi, (match, url) => {
         return `action="${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite formaction attributes (input/button)
+    html = html.replace(/formaction=["']([^"']+)["']/gi, (match, url) => {
+        return `formaction="${rewriteUrl(url, baseUrl)}"`;
     });
 
     // Rewrite background attributes
@@ -115,13 +129,14 @@ function rewriteHtml(html, baseUrl) {
         return `poster="${rewriteUrl(url, baseUrl)}"`;
     });
 
-    // Rewrite srcset
-    html = html.replace(/srcset=["']([^"']+)["']/gi, (match, srcset) => {
-        const rewritten = srcset.split(',').map(part => {
-            const [url, descriptor] = part.trim().split(/\s+/);
-            return rewriteUrl(url, baseUrl) + (descriptor ? ' ' + descriptor : '');
-        }).join(', ');
-        return `srcset="${rewritten}"`;
+    // Rewrite data attributes (object, etc.)
+    html = html.replace(/data=["']([^"']+)["']/gi, (match, url) => {
+        return `data="${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite manifest attributes (html)
+    html = html.replace(/manifest=["']([^"']+)["']/gi, (match, url) => {
+        return `manifest="${rewriteUrl(url, baseUrl)}"`;
     });
 
     // Rewrite meta refresh
@@ -156,11 +171,11 @@ function rewriteHtml(html, baseUrl) {
 
 function rewriteCss(css, baseUrl) {
     // Rewrite url() references
-    css = css.replace(/url\(["']?([^"')\s]+)["']?\)/gi, (match, url) => {
-        return `url("${rewriteUrl(url, baseUrl)}")`;
+    css = css.replace(/url\(\s*["']?([^"')]+?)["']?\s*\)/gi, (match, url) => {
+        return `url("${rewriteUrl(url.trim(), baseUrl)}")`;
     });
 
-    // Rewrite @import
+    // Rewrite @import with quotes
     css = css.replace(/@import\s+["']([^"']+)["']/gi, (match, url) => {
         return `@import "${rewriteUrl(url, baseUrl)}"`;
     });
@@ -169,9 +184,14 @@ function rewriteCss(css, baseUrl) {
 }
 
 function rewriteJs(js, baseUrl) {
-    // Rewrite fetch calls
+    // Rewrite fetch calls (string literals)
     js = js.replace(/fetch\s*\(\s*["']([^"']+)["']/g, (match, url) => {
         return `fetch("${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite fetch with template literals (basic)
+    js = js.replace(/fetch\s*\(\s*`([^`]+)`/g, (match, url) => {
+        return `fetch(\`${rewriteUrl(url, baseUrl)}\``;
     });
 
     // Rewrite XMLHttpRequest.open
@@ -188,6 +208,51 @@ function rewriteJs(js, baseUrl) {
     // Rewrite window.location assignments
     js = js.replace(/window\.location\s*=\s*["']([^"']+)["']/g, (match, url) => {
         return `window.location = "${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite document.location / self.location / top.location
+    js = js.replace(/(document|self|top)\.location\s*=\s*["']([^"']+)["']/g, (match, obj, url) => {
+        return `${obj}.location = "${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite location.assign / location.replace
+    js = js.replace(/location\.(assign|replace)\s*\(\s*["']([^"']+)["']/g, (match, method, url) => {
+        return `location.${method}("${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite window.open
+    js = js.replace(/window\.open\s*\(\s*["']([^"']+)["']/g, (match, url) => {
+        return `window.open("${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite navigator.sendBeacon
+    js = js.replace(/navigator\.sendBeacon\s*\(\s*["']([^"']+)["']/g, (match, url) => {
+        return `navigator.sendBeacon("${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite import statements
+    js = js.replace(/(import\s+(?:[^'"]*?|.*?)\s+from\s+["'])([^"']+)(["'])/g, (match, prefix, url, suffix) => {
+        return prefix + rewriteUrl(url, baseUrl) + suffix;
+    });
+
+    // Rewrite dynamic import()
+    js = js.replace(/(import\s*\(\s*["'])([^"']+)(["']\s*\))/g, (match, prefix, url, suffix) => {
+        return prefix + rewriteUrl(url, baseUrl) + suffix;
+    });
+
+    // Rewrite export ... from
+    js = js.replace(/(export\s+.*?\s+from\s+["'])([^"']+)(["'])/g, (match, prefix, url, suffix) => {
+        return prefix + rewriteUrl(url, baseUrl) + suffix;
+    });
+
+    // Rewrite new Worker / SharedWorker
+    js = js.replace(/new\s+(Worker|SharedWorker)\s*\(\s*["']([^"']+)["']/g, (match, type, url) => {
+        return `new ${type}("${rewriteUrl(url, baseUrl)}"`;
+    });
+
+    // Rewrite jQuery ajax calls
+    js = js.replace(/\$\.(get|post|ajax)\s*\(\s*["']([^"']+)["']/g, (match, method, url) => {
+        return `$.${method}("${rewriteUrl(url, baseUrl)}"`;
     });
 
     return js;
@@ -286,10 +351,16 @@ async function handleProxy(req, res) {
 
                 delete proxyRes.headers['content-encoding'];
 
+                // Remove security headers that break proxied content
+                delete proxyRes.headers['content-security-policy'];
+                delete proxyRes.headers['content-security-policy-report-only'];
+                delete proxyRes.headers['x-frame-options'];
+
                 // Only rewrite text content
                 const isText = contentType.includes('text/html') || 
                               contentType.includes('text/css') || 
                               contentType.includes('javascript') ||
+                              contentType.includes('ecmascript') ||
                               contentType.includes('/js');
 
                 if (isText) {
@@ -299,7 +370,7 @@ async function handleProxy(req, res) {
                         bodyStr = rewriteHtml(bodyStr, targetUrl);
                     } else if (contentType.includes('text/css')) {
                         bodyStr = rewriteCss(bodyStr, targetUrl);
-                    } else if (contentType.includes('javascript') || contentType.includes('/js')) {
+                    } else if (contentType.includes('javascript') || contentType.includes('ecmascript') || contentType.includes('/js')) {
                         bodyStr = rewriteJs(bodyStr, targetUrl);
                     }
 
@@ -317,6 +388,7 @@ async function handleProxy(req, res) {
 
                     const finalData = Buffer.from(bodyStr);
                     proxyRes.headers['content-length'] = finalData.length;
+                    delete proxyRes.headers['transfer-encoding'];
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(finalData);
                 } else {
@@ -394,10 +466,16 @@ async function handleSimpleProxy(req, res) {
 
                 delete proxyRes.headers['content-encoding'];
 
+                // Remove security headers that break proxied content
+                delete proxyRes.headers['content-security-policy'];
+                delete proxyRes.headers['content-security-policy-report-only'];
+                delete proxyRes.headers['x-frame-options'];
+
                 // Only rewrite text content
                 const isText = contentType.includes('text/html') || 
                               contentType.includes('text/css') || 
                               contentType.includes('javascript') ||
+                              contentType.includes('ecmascript') ||
                               contentType.includes('/js');
 
                 if (isText) {
@@ -407,7 +485,7 @@ async function handleSimpleProxy(req, res) {
                         bodyStr = rewriteHtml(bodyStr, targetUrl);
                     } else if (contentType.includes('text/css')) {
                         bodyStr = rewriteCss(bodyStr, targetUrl);
-                    } else if (contentType.includes('javascript') || contentType.includes('/js')) {
+                    } else if (contentType.includes('javascript') || contentType.includes('ecmascript') || contentType.includes('/js')) {
                         bodyStr = rewriteJs(bodyStr, targetUrl);
                     }
 
@@ -425,6 +503,7 @@ async function handleSimpleProxy(req, res) {
 
                     const finalData = Buffer.from(bodyStr);
                     proxyRes.headers['content-length'] = finalData.length;
+                    delete proxyRes.headers['transfer-encoding'];
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(finalData);
                 } else {
@@ -465,7 +544,7 @@ const uvClientJs = `
         for (let i = 0; i < str.length; i++) {
             result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
         }
-        return btoa(result).replace(/\\\\+/g, '-').replace(/\\\\//g, '_').replace(/=/g, '');
+        return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
     }
 
     function xorDecode(str) {
@@ -590,6 +669,14 @@ const uvClientJs = `
         return new OriginalWorker(rewriteUrl(url), options);
     };
 
+    // Override SharedWorker
+    if (window.SharedWorker) {
+        const OriginalSharedWorker = window.SharedWorker;
+        window.SharedWorker = function(url, options) {
+            return new OriginalSharedWorker(rewriteUrl(url), options);
+        };
+    }
+
     // Override importScripts (in workers)
     if (typeof importScripts !== 'undefined') {
         const originalImportScripts = importScripts;
@@ -608,10 +695,10 @@ const uvClientJs = `
     const originalCreateElement = Document.prototype.createElement;
     Document.prototype.createElement = function(tagName, options) {
         const element = originalCreateElement.call(this, tagName, options);
-        if (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'iframe') {
+        if (tagName.toLowerCase() === 'script' || tagName.toLowerCase() === 'iframe' || tagName.toLowerCase() === 'link') {
             const originalSetAttribute = element.setAttribute;
             element.setAttribute = function(name, value) {
-                if (name === 'src') value = rewriteUrl(value);
+                if (name === 'src' || name === 'href') value = rewriteUrl(value);
                 return originalSetAttribute.call(this, name, value);
             };
         }
@@ -776,7 +863,7 @@ const indexHtml = `<!DOCTYPE html>
             for (let i = 0; i < str.length; i++) {
                 result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
             }
-            return btoa(result).replace(/\\\\+/g, '-').replace(/\\\\//g, '_').replace(/=/g, '');
+            return btoa(result).replace(/\\+/g, '-').replace(/\\//g, '_').replace(/=/g, '');
         }
 
         function go() {
