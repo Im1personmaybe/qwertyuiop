@@ -200,6 +200,17 @@ function rewriteUrl(url, baseUrl) {
     }
 }
 
+function assetKind(contentType, targetUrl) {
+    const type = String(contentType || '').toLowerCase().split(';', 1)[0].trim();
+    try {
+        const path = new URL(targetUrl).pathname.toLowerCase();
+        if (type === 'text/css' || type === 'text/stylesheet' || type === 'application/css' || path.endsWith('.css')) return 'css';
+        if (type.includes('javascript') || type.includes('ecmascript') || type === 'text/js' || /\.(?:m?js|cjs|json|map)$/.test(path)) return 'js';
+        if (type === 'text/html' || type === 'application/xhtml+xml' || path.endsWith('.html') || path.endsWith('.htm')) return 'html';
+    } catch {}
+    return '';
+}
+
 function rewriteHtml(html, baseUrl) {
     // Remove <base> tags to prevent incorrect relative URL resolution
     html = html.replace(/<base\b[^>]*>/gi, '');
@@ -609,24 +620,14 @@ async function handleProxy(req, res) {
                         .replace(/;?\s*samesite=[^;]+/gi, ''));
                 }
 
-                // Only rewrite text content
-                const isText = contentType.includes('text/html') || 
-                              contentType.includes('text/css') || 
-                              contentType.includes('javascript') ||
-                              contentType.includes('ecmascript') ||
-                              contentType.includes('/js') ||
-                              contentType.includes('application/json');
-
-                if (isText) {
+                // Rewrite HTML, CSS, and JavaScript even when a CDN sends a
+                // generic MIME type; the URL extension is a safe fallback.
+                const kind = assetKind(contentType, targetUrl);
+                if (kind) {
                     let bodyStr = data.toString('utf-8');
-
-                    if (contentType.includes('text/html')) {
-                        bodyStr = rewriteHtml(bodyStr, targetUrl);
-                    } else if (contentType.includes('text/css')) {
-                        bodyStr = rewriteCss(bodyStr, targetUrl);
-                    } else if (contentType.includes('javascript') || contentType.includes('ecmascript') || contentType.includes('/js')) {
-                        bodyStr = rewriteJs(bodyStr, targetUrl);
-                    }
+                    if (kind === 'html') bodyStr = rewriteHtml(bodyStr, targetUrl);
+                    else if (kind === 'css') bodyStr = rewriteCss(bodyStr, targetUrl);
+                    else if (kind === 'js') bodyStr = rewriteJs(bodyStr, targetUrl);
 
                     const finalData = Buffer.from(bodyStr);
                     proxyRes.headers['content-length'] = finalData.length;
@@ -748,24 +749,14 @@ async function handleSimpleProxy(req, res) {
                         .replace(/;?\s*samesite=[^;]+/gi, ''));
                 }
 
-                // Only rewrite text content
-                const isText = contentType.includes('text/html') || 
-                              contentType.includes('text/css') || 
-                              contentType.includes('javascript') ||
-                              contentType.includes('ecmascript') ||
-                              contentType.includes('/js') ||
-                              contentType.includes('application/json');
-
-                if (isText) {
+                // Rewrite HTML, CSS, and JavaScript even when a CDN sends a
+                // generic MIME type; the URL extension is a safe fallback.
+                const kind = assetKind(contentType, targetUrl);
+                if (kind) {
                     let bodyStr = data.toString('utf-8');
-
-                    if (contentType.includes('text/html')) {
-                        bodyStr = rewriteHtml(bodyStr, targetUrl);
-                    } else if (contentType.includes('text/css')) {
-                        bodyStr = rewriteCss(bodyStr, targetUrl);
-                    } else if (contentType.includes('javascript') || contentType.includes('ecmascript') || contentType.includes('/js')) {
-                        bodyStr = rewriteJs(bodyStr, targetUrl);
-                    }
+                    if (kind === 'html') bodyStr = rewriteHtml(bodyStr, targetUrl);
+                    else if (kind === 'css') bodyStr = rewriteCss(bodyStr, targetUrl);
+                    else if (kind === 'js') bodyStr = rewriteJs(bodyStr, targetUrl);
 
                     const finalData = Buffer.from(bodyStr);
                     proxyRes.headers['content-length'] = finalData.length;
