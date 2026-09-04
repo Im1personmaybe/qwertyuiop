@@ -8,6 +8,14 @@ const http = require('http');
 const https = require('https');
 const { URL } = require('url');
 const zlib = require('zlib');
+const fs = require('fs');
+let HttpProxyAgent, HttpsProxyAgent;
+try {
+    ({ HttpProxyAgent } = require('http-proxy-agent'));
+    ({ HttpsProxyAgent } = require('https-proxy-agent'));
+} catch (err) {
+    console.warn('[proxy-pool] Install http-proxy-agent and https-proxy-agent to enable upstream rotation');
+}
 
 // ============================================
 // CONFIGURATION
@@ -18,6 +26,45 @@ const BARE_PREFIX = '/bare/';
 const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 60000);
 const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 50 * 1024 * 1024);
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
+const PROXY_LIST_FILE = process.env.PROXY_LIST_FILE || './proxies.txt';
+const USE_UPSTREAM_PROXIES = process.env.USE_UPSTREAM_PROXIES !== 'false';
+const PROXY_ATTEMPT_TIMEOUT_MS = 30000;
+
+function loadProxyPool() {
+    if (!USE_UPSTREAM_PROXIES || !fs.existsSync(PROXY_LIST_FILE)) return [];
+    const rank = { fast: 0, medium: 1, slow: 2 };
+    return fs.readFileSync(PROXY_LIST_FILE, 'utf8').split(/\r?\n/).slice(1).map(line => {
+        const c = line.split('\t');
+        if (c.length < 12) return null;
+        const host = c[0].trim(), port = Number(c[1]), protocol = c[3].trim().toLowerCase();
+        const speed = c[6].trim().toLowerCase(), latency = Number.parseFloat(c[10]) || 999999;
+        if (!/^https?$/.test(protocol) || !host || !Number.isInteger(port) || port < 1 || port > 65535) return null;
+        try { new URL(`${protocol}://${host}:${port}`); } catch { return null; }
+        return { host, port, protocol, speed, latency, score: (rank[speed] ?? 9) * 1e6 + latency };
+    }).filter(Boolean).sort((a, b) => a.score - b.score);
+}
+const upstreamProxyPool = loadProxyPool();
+let upstreamProxyIndex = 0;
+function nextUpstreamProxy() {
+    if (!upstreamProxyPool.length) return null;
+    const proxy = upstreamProxyPool[upstreamProxyIndex % upstreamProxyPool.length];
+    upstreamProxyIndex++;
+    return proxy;
+}
+function applyUpstreamProxy(options, target) {
+    const proxy = nextUpstreamProxy();
+    if (!proxy || !HttpProxyAgent || !HttpsProxyAgent) return null;
+    const proxyUrl = `${proxy.protocol}://${proxy.host}:${proxy.port}`;
+    if (target.protocol === 'https:') {
+        options.agent = new HttpsProxyAgent(proxyUrl);
+    } else {
+        options.agent = new HttpProxyAgent(proxyUrl);
+    }
+    options.headers.host = target.host;
+    options.headers.connection = 'close';
+    return proxy;
+}
+
 
 function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
@@ -88,16 +135,27 @@ function cleanHeaders(headers) {
         h['user-agent'] = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
     }
     
-    // Add Accept headers if missing
+    // Do not forward hop-by-hop connection headers from the browser.
+    // A fresh, non-persistent upstream connection is more reliable for sites
+    // such as DuckDuckGo when this server is deployed behind another proxy.
+    delete h['connection'];
+    delete h['keep-alive'];
+    delete h['proxy-connection'];
+    delete h['te'];
+    delete h['trailer'];
+    delete h['upgrade'];
+    delete h['content-length'];
+
+    // Add conservative browser headers if missing. Avoid Brotli here because
+    // some upstream/proxy combinations negotiate it but never finish cleanly.
     if (!h['accept']) {
-        h['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8';
+        h['accept'] = 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8';
     }
     if (!h['accept-language']) {
         h['accept-language'] = 'en-US,en;q=0.9';
     }
-    if (!h['accept-encoding']) {
-        h['accept-encoding'] = 'gzip, deflate, br';
-    }
+    h['accept-encoding'] = 'gzip, deflate';
+    h['connection'] = 'close';
     
     return h;
 }
@@ -424,16 +482,22 @@ async function handleBare(req, res) {
 
         delete options.headers.host;
         options.headers.host = target.host;
+        const selectedProxy = applyUpstreamProxy(options, target);
+        if (selectedProxy) console.log(`[proxy-pool] ${selectedProxy.protocol}://${selectedProxy.host}:${selectedProxy.port} -> ${target.hostname}`);
 
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, (proxyRes) => {
             res.writeHead(proxyRes.statusCode, proxyRes.headers);
             proxyRes.pipe(res);
         });
 
-        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream request timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+        proxyReq.setTimeout(PROXY_ATTEMPT_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream proxy attempt timed out after ${PROXY_ATTEMPT_TIMEOUT_MS}ms`)));
 
         proxyReq.on('error', (err) => {
             if (res.headersSent) return;
+            if (selectedProxy && req.method === 'GET' && (req._proxyAttempts || 0) < 3) {
+                req._proxyAttempts = (req._proxyAttempts || 0) + 1;
+                return handleBare(req, res);
+            }
             res.writeHead(502);
             res.end(JSON.stringify({ error: 'Proxy error', message: err.message }));
         });
@@ -479,6 +543,8 @@ async function handleProxy(req, res) {
 
         delete options.headers.host;
         options.headers.host = target.host;
+        const selectedProxy = applyUpstreamProxy(options, target);
+        if (selectedProxy) console.log(`[proxy-pool] ${selectedProxy.protocol}://${selectedProxy.host}:${selectedProxy.port} -> ${target.hostname}`);
 
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, async (proxyRes) => {
             const contentType = proxyRes.headers['content-type'] || '';
@@ -563,10 +629,14 @@ async function handleProxy(req, res) {
             });
         });
 
-        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream request timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+        proxyReq.setTimeout(PROXY_ATTEMPT_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream proxy attempt timed out after ${PROXY_ATTEMPT_TIMEOUT_MS}ms`)));
 
         proxyReq.on('error', (err) => {
             if (res.headersSent) return;
+            if (selectedProxy && req.method === 'GET' && (req._proxyAttempts || 0) < 3) {
+                req._proxyAttempts = (req._proxyAttempts || 0) + 1;
+                return handleProxy(req, res);
+            }
             res.writeHead(502);
             res.end(`<h1>Proxy Error</h1><p>${escapeHtml(err.message)}</p>`);
         });
@@ -612,6 +682,8 @@ async function handleSimpleProxy(req, res) {
 
         delete options.headers.host;
         options.headers.host = target.host;
+        const selectedProxy = applyUpstreamProxy(options, target);
+        if (selectedProxy) console.log(`[proxy-pool] ${selectedProxy.protocol}://${selectedProxy.host}:${selectedProxy.port} -> ${target.hostname}`);
 
         const proxyReq = (target.protocol === 'https:' ? https : http).request(options, async (proxyRes) => {
             const contentType = proxyRes.headers['content-type'] || '';
@@ -696,10 +768,14 @@ async function handleSimpleProxy(req, res) {
             });
         });
 
-        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream request timed out after ${REQUEST_TIMEOUT_MS}ms`)));
+        proxyReq.setTimeout(PROXY_ATTEMPT_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream proxy attempt timed out after ${PROXY_ATTEMPT_TIMEOUT_MS}ms`)));
 
         proxyReq.on('error', (err) => {
             if (res.headersSent) return;
+            if (selectedProxy && req.method === 'GET' && (req._proxyAttempts || 0) < 3) {
+                req._proxyAttempts = (req._proxyAttempts || 0) + 1;
+                return handleProxy(req, res);
+            }
             res.writeHead(502);
             res.end(`<h1>Proxy Error</h1><p>${escapeHtml(err.message)}</p>`);
         });
