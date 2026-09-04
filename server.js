@@ -15,7 +15,7 @@ const zlib = require('zlib');
 const PORT = process.env.PORT || 8080;
 const PREFIX = '/service/';
 const BARE_PREFIX = '/bare/';
-const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 60000);
 const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 50 * 1024 * 1024);
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
 
@@ -430,9 +430,10 @@ async function handleBare(req, res) {
             proxyRes.pipe(res);
         });
 
-        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error('Upstream request timed out')));
+        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream request timed out after ${REQUEST_TIMEOUT_MS}ms`)));
 
         proxyReq.on('error', (err) => {
+            if (res.headersSent) return;
             res.writeHead(502);
             res.end(JSON.stringify({ error: 'Proxy error', message: err.message }));
         });
@@ -562,9 +563,10 @@ async function handleProxy(req, res) {
             });
         });
 
-        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error('Upstream request timed out')));
+        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream request timed out after ${REQUEST_TIMEOUT_MS}ms`)));
 
         proxyReq.on('error', (err) => {
+            if (res.headersSent) return;
             res.writeHead(502);
             res.end(`<h1>Proxy Error</h1><p>${escapeHtml(err.message)}</p>`);
         });
@@ -694,9 +696,10 @@ async function handleSimpleProxy(req, res) {
             });
         });
 
-        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error('Upstream request timed out')));
+        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error(`Upstream request timed out after ${REQUEST_TIMEOUT_MS}ms`)));
 
         proxyReq.on('error', (err) => {
+            if (res.headersSent) return;
             res.writeHead(502);
             res.end(`<h1>Proxy Error</h1><p>${escapeHtml(err.message)}</p>`);
         });
