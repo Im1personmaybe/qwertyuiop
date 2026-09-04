@@ -779,7 +779,8 @@ const uvClientJs = `
     const originalURL = window.URL;
 
     // Create proxy location object
-    const urlObj = new URL(currentUrl);
+    let urlObj;
+    try { urlObj = new originalURL(currentUrl); } catch (e) { urlObj = new originalURL(location.href); }
     const proxyLoc = {};
     
     const locProps = ['href', 'protocol', 'host', 'hostname', 'port', 'pathname', 'search', 'hash', 'origin', 'username', 'password'];
@@ -814,14 +815,20 @@ const uvClientJs = `
         return currentUrl;
     };
 
-    // Override window.location with Proxy
-    Object.defineProperty(window, 'location', {
-        get: () => proxyLoc,
-        set: (url) => {
-            currentUrl = new URL(url, currentUrl).href;
-            originalLocation.href = PREFIX + xorEncode(currentUrl);
-        }
-    });
+    // Some browsers expose window.location as a non-configurable property.
+    // Treat that as a normal limitation instead of aborting the whole client.
+    try {
+        Object.defineProperty(window, 'location', {
+            configurable: true,
+            get: () => proxyLoc,
+            set: (url) => {
+                currentUrl = new URL(url, currentUrl).href;
+                originalLocation.href = PREFIX + xorEncode(currentUrl);
+            }
+        });
+    } catch (e) {
+        console.debug('[UV] window.location override unavailable');
+    }
 
     // Override document.location
     try {
