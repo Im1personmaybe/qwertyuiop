@@ -28,7 +28,7 @@ const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 50 * 1024 * 
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
 const PROXY_LIST_FILE = process.env.PROXY_LIST_FILE || './proxies.txt';
 const USE_UPSTREAM_PROXIES = process.env.USE_UPSTREAM_PROXIES !== 'false';
-const PROXY_ATTEMPT_TIMEOUT_MS = 30000;
+const PROXY_ATTEMPT_TIMEOUT_MS = 8000;
 
 function loadProxyPool() {
     if (!USE_UPSTREAM_PROXIES || !fs.existsSync(PROXY_LIST_FILE)) return [];
