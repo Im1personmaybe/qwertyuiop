@@ -15,6 +15,29 @@ const zlib = require('zlib');
 const PORT = process.env.PORT || 8080;
 const PREFIX = '/service/';
 const BARE_PREFIX = '/bare/';
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS || 30000);
+const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 50 * 1024 * 1024);
+const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
+
+function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch]));
+}
+
+function isBlockedHostname(hostname) {
+    const host = hostname.toLowerCase().replace(/[\[\]]/g, '');
+    if (ALLOW_PRIVATE_TARGETS) return false;
+    if (host === 'localhost' || host.endsWith('.localhost') || host === '0.0.0.0' || host === '::1') return true;
+    if (/^(10|127)\./.test(host) || /^192\.168\./.test(host) || /^169\.254\./.test(host)) return true;
+    const m = host.match(/^172\.(\d{1,3})\./);
+    return !!(m && Number(m[1]) >= 16 && Number(m[1]) <= 31);
+}
+
+function validateTarget(value) {
+    const target = new URL(value);
+    if (!['http:', 'https:'].includes(target.protocol)) throw new Error('Only http and https targets are supported');
+    if (isBlockedHostname(target.hostname)) throw new Error('Target host is not allowed');
+    return target;
+}
 
 // XOR encoding for URLs (same as UV)
 const XOR_KEY = 'ultraviolet';
@@ -109,11 +132,11 @@ function rewriteUrl(url, baseUrl) {
 
 function rewriteHtml(html, baseUrl) {
     // Remove <base> tags to prevent incorrect relative URL resolution
-    html = html.replace(/<<base\b[^>]*>/gi, '');
+    html = html.replace(/<base\b[^>]*>/gi, '');
 
     // Remove CSP meta tags
-    html = html.replace(/<<meta\b[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
-    html = html.replace(/<<meta\b[^>]*http-equiv=["']Content-Security-Policy-Report-Only["'][^>]*>/gi, '');
+    html = html.replace(/<meta\b[^>]*http-equiv=["']Content-Security-Policy["'][^>]*>/gi, '');
+    html = html.replace(/<meta\b[^>]*http-equiv=["']Content-Security-Policy-Report-Only["'][^>]*>/gi, '');
 
     // Remove integrity attributes (rewritten scripts won't match the hash)
     html = html.replace(/\s+integrity=["'][^"']*["']/gi, '');
@@ -205,14 +228,14 @@ function rewriteHtml(html, baseUrl) {
     });
 
     // Rewrite meta refresh
-    html = html.replace(/<<meta\b[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
+    html = html.replace(/<meta\b[^>]*http-equiv=["']refresh["'][^>]*content=["'](\d+);\s*url=([^"']*)["'][^>]*>/gi, 
         (match, delay, url) => {
             return `<meta http-equiv="refresh" content="${delay}; url=${rewriteUrl(url, baseUrl)}">`;
         }
     );
 
     // Rewrite CSS in style tags
-    html = html.replace(/<<style\b[^>]*>([\s\S]*?)<<\/style>/gi, (match, css) => {
+    html = html.replace(/<style\b[^>]*>([\s\S]*?)<\/style>/gi, (match, css) => {
         return `<style>${rewriteCss(css, baseUrl)}</style>`;
     });
 
@@ -389,7 +412,7 @@ async function handleBare(req, res) {
     }
 
     try {
-        const target = new URL(targetUrl);
+        const target = validateTarget(targetUrl);
         const options = {
             hostname: target.hostname,
             port: target.port || (target.protocol === 'https:' ? 443 : 80),
@@ -406,6 +429,8 @@ async function handleBare(req, res) {
             res.writeHead(proxyRes.statusCode, proxyRes.headers);
             proxyRes.pipe(res);
         });
+
+        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error('Upstream request timed out')));
 
         proxyReq.on('error', (err) => {
             res.writeHead(502);
@@ -441,7 +466,7 @@ async function handleProxy(req, res) {
     }
 
     try {
-        const target = new URL(targetUrl);
+        const target = validateTarget(targetUrl);
         const options = {
             hostname: target.hostname,
             port: target.port || (target.protocol === 'https:' ? 443 : 80),
@@ -458,7 +483,10 @@ async function handleProxy(req, res) {
             const contentType = proxyRes.headers['content-type'] || '';
             let body = [];
 
-            proxyRes.on('data', chunk => body.push(chunk));
+            proxyRes.on('data', chunk => {
+                body.push(chunk);
+                if (Buffer.concat(body).length > MAX_RESPONSE_BYTES) proxyRes.destroy(new Error('Response too large'));
+            });
             proxyRes.on('end', () => {
                 let data = Buffer.concat(body);
 
@@ -488,6 +516,20 @@ async function handleProxy(req, res) {
                 proxyRes.headers['access-control-allow-origin'] = '*';
                 delete proxyRes.headers['access-control-allow-credentials'];
 
+                // Redirects and cookies matter for binary responses too.
+                if (proxyRes.headers.location) proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                if (proxyRes.headers.refresh) {
+                    const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
+                    if (refreshMatch) proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
+                }
+                if (proxyRes.headers['set-cookie']) {
+                    proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => cookie
+                        .replace(/domain=[^;]+/gi, '')
+                        .replace(/path=[^;]+/gi, 'path=/')
+                        .replace(/;?\s*secure/gi, '')
+                        .replace(/;?\s*samesite=[^;]+/gi, ''));
+                }
+
                 // Only rewrite text content
                 const isText = contentType.includes('text/html') || 
                               contentType.includes('text/css') || 
@@ -507,31 +549,6 @@ async function handleProxy(req, res) {
                         bodyStr = rewriteJs(bodyStr, targetUrl);
                     }
 
-                    // Rewrite Location headers - CRITICAL for OAuth redirects
-                    if (proxyRes.headers.location) {
-                        const rewrittenLoc = rewriteUrl(proxyRes.headers.location, targetUrl);
-                        proxyRes.headers.location = rewrittenLoc;
-                    }
-
-                    // Rewrite Refresh headers
-                    if (proxyRes.headers.refresh) {
-                        const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
-                        if (refreshMatch) {
-                            proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
-                        }
-                    }
-
-                    // Rewrite Set-Cookie domain/path
-                    if (proxyRes.headers['set-cookie']) {
-                        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
-                            return cookie
-                                .replace(/domain=[^;]+/gi, '')
-                                .replace(/path=[^;]+/gi, 'path=/')
-                                .replace(/secure/gi, '')
-                                .replace(/samesite=[^;]+/gi, '');
-                        });
-                    }
-
                     const finalData = Buffer.from(bodyStr);
                     proxyRes.headers['content-length'] = finalData.length;
                     delete proxyRes.headers['transfer-encoding'];
@@ -545,16 +562,18 @@ async function handleProxy(req, res) {
             });
         });
 
+        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error('Upstream request timed out')));
+
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<h1>Proxy Error</h1><p>${escapeHtml(err.message)}</p>`);
         });
 
         req.pipe(proxyReq);
 
     } catch (err) {
         res.writeHead(400);
-        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<h1>Error</h1><p>${escapeHtml(err.message)}</p>`);
     }
 }
 
@@ -579,7 +598,7 @@ async function handleSimpleProxy(req, res) {
     }
 
     try {
-        const target = new URL(targetUrl);
+        const target = validateTarget(targetUrl);
         const options = {
             hostname: target.hostname,
             port: target.port || (target.protocol === 'https:' ? 443 : 80),
@@ -596,7 +615,10 @@ async function handleSimpleProxy(req, res) {
             const contentType = proxyRes.headers['content-type'] || '';
             let body = [];
 
-            proxyRes.on('data', chunk => body.push(chunk));
+            proxyRes.on('data', chunk => {
+                body.push(chunk);
+                if (Buffer.concat(body).length > MAX_RESPONSE_BYTES) proxyRes.destroy(new Error('Response too large'));
+            });
             proxyRes.on('end', () => {
                 let data = Buffer.concat(body);
 
@@ -626,6 +648,20 @@ async function handleSimpleProxy(req, res) {
                 proxyRes.headers['access-control-allow-origin'] = '*';
                 delete proxyRes.headers['access-control-allow-credentials'];
 
+                // Redirects and cookies matter for binary responses too.
+                if (proxyRes.headers.location) proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                if (proxyRes.headers.refresh) {
+                    const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
+                    if (refreshMatch) proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
+                }
+                if (proxyRes.headers['set-cookie']) {
+                    proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => cookie
+                        .replace(/domain=[^;]+/gi, '')
+                        .replace(/path=[^;]+/gi, 'path=/')
+                        .replace(/;?\s*secure/gi, '')
+                        .replace(/;?\s*samesite=[^;]+/gi, ''));
+                }
+
                 // Only rewrite text content
                 const isText = contentType.includes('text/html') || 
                               contentType.includes('text/css') || 
@@ -645,30 +681,6 @@ async function handleSimpleProxy(req, res) {
                         bodyStr = rewriteJs(bodyStr, targetUrl);
                     }
 
-                    // Rewrite Location headers
-                    if (proxyRes.headers.location) {
-                        proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
-                    }
-                    
-                    // Rewrite Refresh headers
-                    if (proxyRes.headers.refresh) {
-                        const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
-                        if (refreshMatch) {
-                            proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
-                        }
-                    }
-
-                    // Rewrite Set-Cookie domain/path
-                    if (proxyRes.headers['set-cookie']) {
-                        proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => {
-                            return cookie
-                                .replace(/domain=[^;]+/gi, '')
-                                .replace(/path=[^;]+/gi, 'path=/')
-                                .replace(/secure/gi, '')
-                                .replace(/samesite=[^;]+/gi, '');
-                        });
-                    }
-
                     const finalData = Buffer.from(bodyStr);
                     proxyRes.headers['content-length'] = finalData.length;
                     delete proxyRes.headers['transfer-encoding'];
@@ -682,16 +694,18 @@ async function handleSimpleProxy(req, res) {
             });
         });
 
+        proxyReq.setTimeout(REQUEST_TIMEOUT_MS, () => proxyReq.destroy(new Error('Upstream request timed out')));
+
         proxyReq.on('error', (err) => {
             res.writeHead(502);
-            res.end(`<<h1>Proxy Error</h1><p>${err.message}</p>`);
+            res.end(`<h1>Proxy Error</h1><p>${escapeHtml(err.message)}</p>`);
         });
 
         req.pipe(proxyReq);
 
     } catch (err) {
         res.writeHead(400);
-        res.end(`<<h1>Error</h1><p>${err.message}</p>`);
+        res.end(`<h1>Error</h1><p>${escapeHtml(err.message)}</p>`);
     }
 }
 
@@ -711,7 +725,7 @@ const uvClientJs = `
         for (let i = 0; i < str.length; i++) {
             result += String.fromCharCode(str.charCodeAt(i) ^ XOR_KEY.charCodeAt(i % XOR_KEY.length));
         }
-        return btoa(result).replace(/\\\\+/g, '-').replace(/\\\\//g, '_').replace(/=/g, '');
+        return btoa(result).replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
     }
 
     function xorDecode(str) {
@@ -1254,7 +1268,8 @@ const server = http.createServer((req, res) => {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH');
     res.setHeader('Access-Control-Allow-Headers', '*');
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
+    // Credentials cannot be combined with a wildcard origin.
+    // Keep this endpoint intentionally non-credentialed.
 
     if (req.method === 'OPTIONS') {
         res.writeHead(204);
