@@ -635,7 +635,11 @@ async function handleProxy(req, res) {
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(finalData);
                 } else {
-                    // Binary data - pass through unchanged
+                    // Binary assets may also have been decompressed above. The
+                    // upstream Content-Length describes the compressed payload,
+                    // so replace it with the bytes actually sent to the browser.
+                    proxyRes.headers['content-length'] = data.length;
+                    delete proxyRes.headers['transfer-encoding'];
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(data);
                 }
@@ -764,7 +768,11 @@ async function handleSimpleProxy(req, res) {
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(finalData);
                 } else {
-                    // Binary data - pass through unchanged
+                    // Binary assets may also have been decompressed above. The
+                    // upstream Content-Length describes the compressed payload,
+                    // so replace it with the bytes actually sent to the browser.
+                    proxyRes.headers['content-length'] = data.length;
+                    delete proxyRes.headers['transfer-encoding'];
                     res.writeHead(proxyRes.statusCode, proxyRes.headers);
                     res.end(data);
                 }
