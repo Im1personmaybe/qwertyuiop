@@ -28,7 +28,7 @@ const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES || 50 * 1024 * 
 const ALLOW_PRIVATE_TARGETS = process.env.ALLOW_PRIVATE_TARGETS === 'true';
 const PROXY_LIST_FILE = process.env.PROXY_LIST_FILE || './proxies.txt';
 const USE_UPSTREAM_PROXIES = process.env.USE_UPSTREAM_PROXIES !== 'false';
-const PROXY_ATTEMPT_TIMEOUT_MS = 8000;
+const PROXY_ATTEMPT_TIMEOUT_MS = 30000;
 
 function loadProxyPool() {
     if (!USE_UPSTREAM_PROXIES || !fs.existsSync(PROXY_LIST_FILE)) return [];
@@ -163,6 +163,18 @@ function cleanHeaders(headers) {
 // ============================================
 // URL REWRITER
 // ============================================
+function rewriteRedirectUrl(value, baseUrl) {
+    if (!value || typeof value !== 'string') return value;
+    const trimmed = value.trim();
+    try {
+        const base = new URL(baseUrl);
+        const absolute = new URL(trimmed, base);
+        return PREFIX + xorEncode(absolute.href);
+    } catch {
+        return trimmed;
+    }
+}
+
 function rewriteUrl(url, baseUrl) {
     if (!url || typeof url !== 'string') return url;
     if (url.startsWith('data:') || url.startsWith('javascript:') || url.startsWith('blob:') || url.startsWith('mailto:')) {
@@ -584,10 +596,10 @@ async function handleProxy(req, res) {
                 delete proxyRes.headers['access-control-allow-credentials'];
 
                 // Redirects and cookies matter for binary responses too.
-                if (proxyRes.headers.location) proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                if (proxyRes.headers.location) proxyRes.headers.location = rewriteRedirectUrl(proxyRes.headers.location, targetUrl);
                 if (proxyRes.headers.refresh) {
                     const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
-                    if (refreshMatch) proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
+                    if (refreshMatch) proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteRedirectUrl(refreshMatch[2], targetUrl)}`;
                 }
                 if (proxyRes.headers['set-cookie']) {
                     proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => cookie
@@ -723,10 +735,10 @@ async function handleSimpleProxy(req, res) {
                 delete proxyRes.headers['access-control-allow-credentials'];
 
                 // Redirects and cookies matter for binary responses too.
-                if (proxyRes.headers.location) proxyRes.headers.location = rewriteUrl(proxyRes.headers.location, targetUrl);
+                if (proxyRes.headers.location) proxyRes.headers.location = rewriteRedirectUrl(proxyRes.headers.location, targetUrl);
                 if (proxyRes.headers.refresh) {
                     const refreshMatch = proxyRes.headers.refresh.match(/(\d+);\s*url=(.+)/i);
-                    if (refreshMatch) proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteUrl(refreshMatch[2], targetUrl)}`;
+                    if (refreshMatch) proxyRes.headers.refresh = `${refreshMatch[1]}; url=${rewriteRedirectUrl(refreshMatch[2], targetUrl)}`;
                 }
                 if (proxyRes.headers['set-cookie']) {
                     proxyRes.headers['set-cookie'] = proxyRes.headers['set-cookie'].map(cookie => cookie
