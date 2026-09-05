@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: secure-forward-proxy
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PROXY_USERNAME
+        sync: false
+      - key: PROXY_PASSWORD
+        generateValue: true
+      - key: ALLOWED_CLIENTS
+        sync: false
+      - key: PROXY_LIST_URL
+        sync: false
+      - key: REFRESH_SECONDS
+        value: "300"
+      - key: HEALTHCHECK_SECONDS
+        value: "120"
+      - key: MAX_CONNECTIONS
+        value: "100"
+      - key: DIRECT_FALLBACK
+        value: "false"
